@@ -26,17 +26,22 @@ REPORT=$(node collect.js) && node notify.js "$REPORT"
 
 ## 수집 항목 (collect.js 가 처리)
 
-각 기사에는 발행사가 제공하는 `og:description` 을 1행 요약으로 함께 붙인다(LLM 미사용).
+데이터 취득은 코드로(환각 없음), 보강(번역·선별)만 LLM이 한다.
 
-### 기술 정보
-- Velog 트렌드 상위 5개 + 1행 요약 (v3.velog.io GraphQL)
-- 요즘IT 인기 기사 상위 5개 + 1행 요약 (yozm.wishket.com)
-- GitHub Trending 당일 상위 5개 + repo 설명 (github.com/trending)
-
-### 경제 정보
+- Velog 트렌드 5개 + 1행 요약 (v3.velog.io GraphQL) — 후보 중 IT·경제 글을 LLM이 선별
+- 요즘IT 인기 기사 5개 — 제목만 (yozm.wishket.com)
+- GitHub Trending 5개 — 기능을 LLM이 한국어 1줄로 요약 (github.com/trending)
 - 코스피/코스닥 지수: 현재값·전일 대비·등락률 (네이버 금융)
 - USD/KRW 환율: 현재값 (open.er-api.com)
 - 주요 마켓 뉴스 4건 (한국경제 증권 RSS, /feed/finance) — 헤드라인 자체가 요약
+
+## LLM 보강 (enrich.js)
+
+`claude -p`(헤드리스 Claude Code, 모델 `claude-sonnet-4-6`)를 1회 호출해
+① velog 후보에서 IT·기술·경제 글만 선별(취업/회고/스팸/무관 글 제외),
+② GitHub repo 설명을 한국어 1줄로 요약한다.
+LLM 호출이 실패하면 순수 코드로 폴백한다(velog 키워드 필터·GitHub 원문 설명).
+모델은 `NEWS_LLM_MODEL` 환경변수로 바꿀 수 있다.
 
 ## 출력 포맷
 
@@ -47,5 +52,6 @@ REPORT=$(node collect.js) && node notify.js "$REPORT"
 
 ## 자동화
 
-매일 자동 실행은 cron 으로 `run.sh` 를 등록한다(README 참고). Claude 세션이
-떠 있을 필요가 없다.
+매일 자동 실행은 cron 으로 `run.sh` 를 등록한다(README 참고). 대화형 Claude 세션은
+필요 없으나, LLM 보강을 위해 cron이 헤드리스 `claude -p` 를 호출하므로 `claude` CLI가
+PATH(`~/.local/bin`)에 있고 로그인돼 있어야 한다.

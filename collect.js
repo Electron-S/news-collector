@@ -6,6 +6,7 @@
 const fs = require('fs');
 const path = require('path');
 const cheerio = require('cheerio');
+const { enrich } = require('./enrich');
 
 const UA =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
@@ -61,26 +62,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const num = (n) => Number(n).toLocaleString('ko-KR', { maximumFractionDigits: 2 });
 const signed = (n) => (n >= 0 ? '+' : '') + num(n);
 
-// ── 1행 요약 (발행사 og:description, LLM 미사용·무환각) ──────
-function decodeEntities(s) {
-  const text = String(s ?? '');
-  const safeCodePoint = (v, radix) => {
-    const cp = parseInt(v, radix);
-    return cp >= 0 && cp <= 0x10FFFF && !(cp >= 0xD800 && cp <= 0xDFFF)
-      ? String.fromCodePoint(cp)
-      : '�';
-  };
-  return text
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => safeCodePoint(h, 16))
-    .replace(/&#(\d+);/g, (_, d) => safeCodePoint(d, 10))
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&');
-}
-
+// ── 1행 요약 ────────────────────────────────────────────────
+// 요약은 각 소스가 제공하는 텍스트(velog short_description, GitHub repo 설명)를
+// 그대로 쓴다. 글 페이지를 따로 fetch 하지 않으므로 요청 수가 적고 안정적이다.
 const SUMMARY_MAX = 100;
 
 // 공백 정리 후 max 길이로 자르고 말줄임표를 붙인다.
@@ -89,50 +73,50 @@ const clip = (s, max = SUMMARY_MAX) => {
   return t.length > max ? `${t.slice(0, max).trim()}…` : t;
 };
 
-async function fetchOgDescription(url) {
-  let html;
-  try {
-    html = await fetchText(url, { retries: 1 });
-  } catch (err) {
-    console.error(`[요약 실패] ${url}: ${err?.message ?? err}`);
-    return '';
-  }
-  try {
-    const $ = cheerio.load(html);
-    const raw = $('meta[property="og:description"]').attr('content') || '';
-    return clip(decodeEntities(raw));
-  } catch (err) {
-    console.error(`[요약 파싱 오류] ${url}: ${err?.message ?? err}`);
-    return '';
-  }
-}
-
-// 항목들의 요약을 순차로 취득해 it.summary 에 채운다(실패 항목은 빈 문자열).
-// 병렬 대신 순차로 처리해 대상 서버에 부담을 주지 않는다.
-async function attachSummaries(items) {
-  for (const it of items) {
-    it.summary = await fetchOgDescription(it.url);
-  }
-  return items;
-}
-
 // ── 수집기 ──────────────────────────────────────────────────
+
+// velog 트렌딩에서 제외할 주제 키워드(취업·면접·개인 회고/일상 등).
+// IT 기술·경제 주제 위주로 추리기 위함이며, 제목·태그에 매칭한다.
+const VELOG_EXCLUDE = [
+  '면접', '합격', '후기', '회고', '취업', '취준', '자소서', '이력서', '채용',
+  '인턴', '신입', '일기', '일상', '다이어리', '부트캠프', '코딩테스트', '코테',
+  '수강', '졸업', '학점',
+];
+
+function isCareerOrPersonal(post) {
+  const hay = `${post.title} ${(post.tags ?? []).join(' ')}`.toLowerCase();
+  return VELOG_EXCLUDE.some((kw) => hay.includes(kw));
+}
+
 async function collectVelog() {
+  // short_description 를 함께 받아 글 페이지를 따로 fetch 하지 않는다(요청 수·throttle↓).
   const query =
-    'query{trendingPosts(input:{limit:5,timeframe:"day"}){title url_slug user{username}}}';
+    'query{trendingPosts(input:{limit:20,timeframe:"day"}){title url_slug short_description tags user{username}}}';
   const data = await fetchJson('https://v3.velog.io/graphql', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    // velog API는 브라우저 UA + 대량 요청을 스크래핑으로 보고 차단하므로 비브라우저 UA를 보낸다.
+    headers: { 'Content-Type': 'application/json', 'User-Agent': 'news-collector/1.0' },
     body: JSON.stringify({ query }),
   });
   const posts = data?.data?.trendingPosts ?? [];
   if (!posts.length) throw new Error('빈 응답');
-  const out = posts.slice(0, 5).map((p) => ({
-    title: p.title,
-    url: `https://velog.io/@${p.user.username}/${p.url_slug}`,
-    author: p.user.username,
-  }));
-  return attachSummaries(out);
+  // 후보를 넉넉히 반환하고 최종 5개 선별은 LLM(enrich)이 한다.
+  // 키워드 필터 순서(기술 우선)는 LLM 미사용 시 폴백(앞 5개)용으로 유지한다.
+  const ordered = posts.slice().sort((a, b) => {
+    const aEx = isCareerOrPersonal(a);
+    const bEx = isCareerOrPersonal(b);
+    return aEx === bEx ? 0 : aEx ? 1 : -1;
+  });
+  return ordered
+    .filter((p) => p.user?.username && p.url_slug)
+    .slice(0, 15)
+    .map((p) => ({
+      title: p.title,
+      url: `https://velog.io/@${p.user.username}/${p.url_slug}`,
+      author: p.user.username,
+      summary: clip(p.short_description),
+      tags: p.tags ?? [],
+    }));
 }
 
 async function collectYozm() {
@@ -151,7 +135,8 @@ async function collectYozm() {
     out.push({ title, url: `https://yozm.wishket.com${href}` });
   });
   if (!out.length) throw new Error('기사 없음');
-  return attachSummaries(out.slice(0, 5));
+  // 요즘IT는 제목만 표시하므로 요약(og:description)을 가져오지 않는다.
+  return out.slice(0, 5);
 }
 
 async function collectGithub() {
@@ -224,7 +209,6 @@ const FAIL = '[취득 실패]';
 
 function fmtIndex(idx) {
   const L = [];
-  L.push('### 기술 정보\n');
 
   const summaryLine = (s) => {
     if (s) L.push(`   └ ${s}`);
@@ -241,10 +225,7 @@ function fmtIndex(idx) {
 
   L.push('#### 요즘IT 인기 기사 (상위 5개)');
   if (idx.yozm) {
-    idx.yozm.forEach((a, i) => {
-      L.push(`${i + 1}. [${a.title}](${a.url})`);
-      summaryLine(a.summary);
-    });
+    idx.yozm.forEach((a, i) => L.push(`${i + 1}. [${a.title}](${a.url})`));
   } else L.push(FAIL);
   L.push('');
 
@@ -252,12 +233,10 @@ function fmtIndex(idx) {
   if (idx.github) {
     idx.github.forEach((g, i) => {
       L.push(`${i + 1}. [${g.repo}](${g.url})${g.stars ? ` (${g.stars})` : ''}`);
-      summaryLine(g.desc);
+      summaryLine(g.summaryKo || g.desc); // LLM 한글 요약 우선, 없으면 원문 설명
     });
   } else L.push(FAIL);
   L.push('');
-
-  L.push('### 경제 정보\n');
 
   L.push('#### 코스피/코스닥');
   if (idx.kospi) {
@@ -317,6 +296,24 @@ async function main() {
     run('kosdaq', () => collectNaverIndex('KOSDAQ')),
     run('usdkrw', collectUsdKrw),
   ]);
+
+  // LLM 보강(Claude Code): velog 선별 + GitHub 한글 요약. 실패 시 순수 코드로 폴백.
+  const enriched = await enrich({ velog: idx.velog ?? [], github: idx.github ?? [] });
+  if (idx.velog) {
+    const keep = enriched?.velogKeep;
+    const picked = keep?.length
+      ? [...new Set(keep)].map((i) => idx.velog[i]).filter(Boolean)
+      : idx.velog;
+    idx.velog = picked.slice(0, 5);
+  }
+  if (idx.github && enriched?.githubKo) {
+    idx.github.forEach((g, i) => {
+      const key = String(i);
+      if (Object.prototype.hasOwnProperty.call(enriched.githubKo, key)) {
+        g.summaryKo = enriched.githubKo[key];
+      }
+    });
+  }
 
   fs.mkdirSync(REPORTS_DIR, { recursive: true });
   const section = `\n${sectionHeader} (취득 시각: ${stamp})\n\n${fmtIndex(idx)}\n`;

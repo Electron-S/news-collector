@@ -61,6 +61,61 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const num = (n) => Number(n).toLocaleString('ko-KR', { maximumFractionDigits: 2 });
 const signed = (n) => (n >= 0 ? '+' : '') + num(n);
 
+// ── 1행 요약 (발행사 og:description, LLM 미사용·무환각) ──────
+function decodeEntities(s) {
+  const text = String(s ?? '');
+  const safeCodePoint = (v, radix) => {
+    const cp = parseInt(v, radix);
+    return cp >= 0 && cp <= 0x10FFFF && !(cp >= 0xD800 && cp <= 0xDFFF)
+      ? String.fromCodePoint(cp)
+      : '�';
+  };
+  return text
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => safeCodePoint(h, 16))
+    .replace(/&#(\d+);/g, (_, d) => safeCodePoint(d, 10))
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&');
+}
+
+const SUMMARY_MAX = 100;
+
+// 공백 정리 후 max 길이로 자르고 말줄임표를 붙인다.
+const clip = (s, max = SUMMARY_MAX) => {
+  const t = String(s ?? '').replace(/\s+/g, ' ').trim();
+  return t.length > max ? `${t.slice(0, max).trim()}…` : t;
+};
+
+async function fetchOgDescription(url) {
+  let html;
+  try {
+    html = await fetchText(url, { retries: 1 });
+  } catch (err) {
+    console.error(`[요약 실패] ${url}: ${err?.message ?? err}`);
+    return '';
+  }
+  try {
+    const $ = cheerio.load(html);
+    const raw = $('meta[property="og:description"]').attr('content') || '';
+    return clip(decodeEntities(raw));
+  } catch (err) {
+    console.error(`[요약 파싱 오류] ${url}: ${err?.message ?? err}`);
+    return '';
+  }
+}
+
+// 항목들의 요약을 순차로 취득해 it.summary 에 채운다(실패 항목은 빈 문자열).
+// 병렬 대신 순차로 처리해 대상 서버에 부담을 주지 않는다.
+async function attachSummaries(items) {
+  for (const it of items) {
+    it.summary = await fetchOgDescription(it.url);
+  }
+  return items;
+}
+
 // ── 수집기 ──────────────────────────────────────────────────
 async function collectVelog() {
   const query =
@@ -72,11 +127,12 @@ async function collectVelog() {
   });
   const posts = data?.data?.trendingPosts ?? [];
   if (!posts.length) throw new Error('빈 응답');
-  return posts.slice(0, 5).map((p) => ({
+  const out = posts.slice(0, 5).map((p) => ({
     title: p.title,
     url: `https://velog.io/@${p.user.username}/${p.url_slug}`,
     author: p.user.username,
   }));
+  return attachSummaries(out);
 }
 
 async function collectYozm() {
@@ -95,7 +151,7 @@ async function collectYozm() {
     out.push({ title, url: `https://yozm.wishket.com${href}` });
   });
   if (!out.length) throw new Error('기사 없음');
-  return out.slice(0, 5);
+  return attachSummaries(out.slice(0, 5));
 }
 
 async function collectGithub() {
@@ -105,7 +161,7 @@ async function collectGithub() {
   $('article.Box-row').each((_, el) => {
     const repo = $(el).find('h2 a').attr('href')?.replace(/^\//, '').trim();
     if (!repo) return;
-    const desc = $(el).find('p').first().text().replace(/\s+/g, ' ').trim();
+    const desc = clip($(el).find('p').first().text());
     const stars = $(el).find('span.float-sm-right').text().replace(/\s+/g, ' ').trim();
     out.push({ repo, url: `https://github.com/${repo}`, desc, stars });
   });
@@ -121,15 +177,18 @@ async function collectNaverIndex(code) {
   );
   const d = data?.datas?.[0];
   if (!d) throw new Error('데이터 없음');
+  // raw 등락액·등락률은 이미 부호를 포함한다(예: 하락 시 "-16.57", "-1.82").
+  // 부호를 다시 파생하지 말고 그대로 사용한다.
   const current = Number(d.closePriceRaw ?? String(d.closePrice).replace(/,/g, ''));
-  const mag = Number(
+  const diff = Number(
     d.compareToPreviousClosePriceRaw ?? String(d.compareToPreviousClosePrice).replace(/,/g, '')
   );
-  const ratio = Math.abs(Number(String(d.fluctuationsRatio).replace(/,/g, '')));
-  const falling = /FALLING|LOWER_LIMIT/.test(d.compareToPreviousPrice?.name ?? '');
-  const sign = falling ? -1 : 1;
-  if (!Number.isFinite(current) || !Number.isFinite(mag)) throw new Error('값 파싱 실패');
-  return { current, diff: mag * sign, pct: ratio * sign, marketStatus: d.marketStatus };
+  const pctRaw = Number(String(d.fluctuationsRatio).replace(/,/g, ''));
+  // fluctuationsRatio가 절대값으로 오는 경우 diff 부호와 동기화해 상승/하락 방향을 맞춘다.
+  const pct = Math.abs(pctRaw) * Math.sign(diff || 1);
+  if (!Number.isFinite(current) || !Number.isFinite(diff) || !Number.isFinite(pct))
+    throw new Error('값 파싱 실패');
+  return { current, diff, pct, marketStatus: d.marketStatus };
 }
 
 // USD/KRW: 무료·무키 환율 API.
@@ -142,7 +201,8 @@ async function collectUsdKrw() {
 }
 
 async function collectMarketNews() {
-  const xml = await fetchText('https://www.hankyung.com/feed/economy');
+  // 증권(finance) 피드: 실제 마켓 헤드라인. economy 피드는 기업 PR 위주라 부적합.
+  const xml = await fetchText('https://www.hankyung.com/feed/finance');
   const pick = (block, tag) => {
     const m = block.match(
       new RegExp(`<${tag}>(?:<!\\[CDATA\\[)?([\\s\\S]*?)(?:\\]\\]>)?</${tag}>`)
@@ -152,45 +212,54 @@ async function collectMarketNews() {
   const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)]
     .map((m) => ({ title: pick(m[1], 'title'), url: pick(m[1], 'link') }))
     .filter((x) => x.title && x.url)
-    .slice(0, 3);
+    .slice(0, 4);
   if (!items.length) throw new Error('뉴스 없음');
+  // 증권 헤드라인 자체가 한 줄 요약 역할을 한다. 기사 og:description 은
+  // "제목, 기자, 증권" 형태로 제목과 중복되므로 별도 요약을 붙이지 않는다.
   return items;
 }
 
 // ── 리포트 포맷 ─────────────────────────────────────────────
 const FAIL = '[취득 실패]';
 
-function fmtIndex(idx, stamp) {
+function fmtIndex(idx) {
   const L = [];
   L.push('### 기술 정보\n');
 
+  const summaryLine = (s) => {
+    if (s) L.push(`   └ ${s}`);
+  };
+
   L.push('#### Velog 트렌딩 (상위 5개)');
-  L.push(`취득 시각: ${stamp}`);
   if (idx.velog) {
-    idx.velog.forEach((p, i) => L.push(`${i + 1}. [${p.title}](${p.url}) — ${p.author}`));
+    idx.velog.forEach((p, i) => {
+      L.push(`${i + 1}. [${p.title}](${p.url}) — ${p.author}`);
+      summaryLine(p.summary);
+    });
   } else L.push(FAIL);
   L.push('');
 
   L.push('#### 요즘IT 인기 기사 (상위 5개)');
-  L.push(`취득 시각: ${stamp}`);
   if (idx.yozm) {
-    idx.yozm.forEach((a, i) => L.push(`${i + 1}. [${a.title}](${a.url})`));
+    idx.yozm.forEach((a, i) => {
+      L.push(`${i + 1}. [${a.title}](${a.url})`);
+      summaryLine(a.summary);
+    });
   } else L.push(FAIL);
   L.push('');
 
   L.push('#### GitHub Trending (당일)');
-  L.push(`취득 시각: ${stamp}`);
   if (idx.github) {
-    idx.github.forEach((g, i) =>
-      L.push(`${i + 1}. [${g.repo}](${g.url})${g.desc ? ` — ${g.desc}` : ''}${g.stars ? ` (${g.stars})` : ''}`)
-    );
+    idx.github.forEach((g, i) => {
+      L.push(`${i + 1}. [${g.repo}](${g.url})${g.stars ? ` (${g.stars})` : ''}`);
+      summaryLine(g.desc);
+    });
   } else L.push(FAIL);
   L.push('');
 
   L.push('### 경제 정보\n');
 
   L.push('#### 코스피/코스닥');
-  L.push(`취득 시각: ${stamp}`);
   if (idx.kospi) {
     L.push(`- 코스피: **${num(idx.kospi.current)} pt** (전일 대비 **${signed(idx.kospi.diff)} (${signed(idx.kospi.pct)}%)**)`);
   } else L.push(`- 코스피: ${FAIL}`);
@@ -200,15 +269,16 @@ function fmtIndex(idx, stamp) {
   L.push('');
 
   L.push('#### USD/KRW 환율');
-  L.push(`취득 시각: ${stamp}`);
   if (idx.usdkrw) {
     L.push(`- 현재값: **${num(idx.usdkrw.current)} 원**`);
   } else L.push(`- ${FAIL}`);
   L.push('');
 
-  L.push('#### 주요 마켓 뉴스');
+  L.push('#### 주요 마켓 뉴스 (한국경제 증권)');
   if (idx.news) {
-    idx.news.forEach((n, i) => L.push(`${i + 1}. [${n.title}](${n.url})`));
+    idx.news.forEach((n, i) => {
+      L.push(`${i + 1}. [${n.title}](${n.url})`);
+    });
   } else L.push(FAIL);
 
   return L.join('\n');
@@ -249,7 +319,7 @@ async function main() {
   ]);
 
   fs.mkdirSync(REPORTS_DIR, { recursive: true });
-  const section = `\n${sectionHeader} (취득 시각: ${stamp})\n\n${fmtIndex(idx, stamp)}\n`;
+  const section = `\n${sectionHeader} (취득 시각: ${stamp})\n\n${fmtIndex(idx)}\n`;
   if (!existing) {
     fs.writeFileSync(
       file,

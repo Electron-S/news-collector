@@ -18,7 +18,7 @@ const ipv4Agent = new https.Agent({ family: 4 });
 const http = axios.create({ httpsAgent: ipv4Agent, timeout: 15000 });
 const API = `https://api.telegram.org/bot${TOKEN}`;
 
-const CHUNK_LIMIT = 3800; // Telegram 4096자 한도 + HTML 태그 여유
+const CHUNK_LIMIT = 4000; // Telegram 4096자 한도 - 안전 여유
 const MAX_RETRIES = 3;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -37,6 +37,7 @@ function renderInline(text) {
 function mdToHtml(md) {
   return md
     .split('\n')
+    .filter((line) => !/^\s*<!--/.test(line)) // 텔레그램에서 불필요한 주석 줄 제거
     .map((line) => {
       const escaped = escapeHtml(line);
       const header = escaped.match(/^#{1,6}\s+(.*)$/);

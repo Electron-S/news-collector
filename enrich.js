@@ -1,7 +1,7 @@
 'use strict';
 
 // LLM 보강: Claude Code(claude -p, Sonnet)를 헤드리스로 호출해
-//  1) velog 후보 중 IT·기술·경제 관련 글만 선별(취업/회고/스팸/무관 글 제외)
+//  1) 요즘IT 후보를 AI 관련도가 높은 순으로 재정렬·선별
 //  2) GitHub repo 설명을 한국어 한 줄로 요약
 // 한 번의 호출로 처리하며, 실패 시 null 을 반환해 호출부가 순수 코드로 폴백한다.
 
@@ -16,8 +16,9 @@ function runClaude(prompt) {
       'claude',
       ['-p', prompt, '--model', MODEL, '--output-format', 'json'],
       { timeout: TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024 },
-      (err, stdout) => {
+      (err, stdout, stderr) => {
         if (err) return reject(err);
+        if (stderr && stderr.trim()) console.error(`[claude stderr] ${stderr.trim()}`);
         resolve(stdout);
       }
     );
@@ -38,35 +39,36 @@ function parseResult(stdout) {
   return JSON.parse(text.slice(start, end + 1));
 }
 
-function buildPrompt(velog, github) {
+function buildPrompt(yozm, github) {
   const input = {
-    velog: velog.map((p, i) => ({ id: i, title: p.title, tags: p.tags ?? [] })),
+    yozm: yozm.map((a, i) => ({ id: i, title: a.title })),
     github: github.map((g, i) => ({ id: i, repo: g.repo, desc: g.desc })),
   };
   return [
     '너는 한국어 IT/경제 데일리 다이제스트 큐레이터다. 아래 입력을 보고 결과 JSON만 출력한다(코드펜스·설명 금지).',
     '',
-    '1) VELOG 후보(개발 블로그 트렌딩) 중 IT·기술·개발·경제와 관련이 높은 항목 id를 관련도순으로 최대 5개 고른다.',
-    '   취업/면접/합격/회고/일상 글, 광고·스팸성(예: 카드현금화·대출·도박), 주제 무관 글은 제외한다.',
+    '1) YOZM 후보(IT 기사) 중 AI·머신러닝·LLM·생성형AI 관련도가 높은 순으로 id를 최대 5개 고른다.',
+    '   AI 관련 기사가 5개 미만이면 나머지는 일반 IT·기술 기사로 채우되 항상 AI 관련 글을 앞에 둔다.',
     '2) GITHUB 각 repo의 기능을 한국어 한 문장(40자 이내, 따옴표 없이)으로 요약한다.',
     '',
     '--- 입력 시작 ---',
     JSON.stringify(input),
     '--- 입력 끝 ---',
     '',
-    '출력 형식(이 스키마만): {"velogKeep":[id,...],"github":{"<id>":"요약",...}}',
+    '출력 형식(이 스키마만): {"yozmKeep":[id,...],"github":{"<id>":"요약",...}}',
   ].join('\n');
 }
 
-// 반환: { velogKeep: number[], githubKo: Record<number,string> } 또는 실패 시 null
-async function enrich({ velog = [], github = [] }) {
-  if (!velog.length && !github.length) return null;
+// 반환: { yozmKeep: number[], githubKo: Record<number,string> } 또는 실패 시 null
+async function enrich({ yozm = [], github = [] }) {
+  if (!yozm.length && !github.length) return null;
+  // id 목록을 유효 범위(0..len-1) 정수로만 거른다.
+  const validIds = (arr, len) =>
+    Array.isArray(arr) ? arr.filter((n) => Number.isInteger(n) && n >= 0 && n < len) : [];
   try {
-    const stdout = await runClaude(buildPrompt(velog, github));
+    const stdout = await runClaude(buildPrompt(yozm, github));
     const parsed = parseResult(stdout);
-    const velogKeep = Array.isArray(parsed.velogKeep)
-      ? parsed.velogKeep.filter((n) => Number.isInteger(n) && n >= 0 && n < velog.length)
-      : [];
+    const yozmKeep = validIds(parsed.yozmKeep, yozm.length);
     const githubKo = {};
     if (parsed.github && typeof parsed.github === 'object' && parsed.github !== null) {
       for (const [k, v] of Object.entries(parsed.github)) {
@@ -76,12 +78,61 @@ async function enrich({ velog = [], github = [] }) {
         }
       }
     }
-    if (!velogKeep.length && !Object.keys(githubKo).length) return null;
-    return { velogKeep, githubKo };
+    if (!yozmKeep.length && !Object.keys(githubKo).length) return null;
+    return { yozmKeep, githubKo };
   } catch (err) {
     console.error(`[LLM 보강 실패] ${err?.message ?? err} — 순수 코드로 폴백`);
     return null;
   }
 }
 
-module.exports = { enrich };
+// ── 텔레그램 채널 메시지 선별 ───────────────────────────────
+function buildTelegramPrompt(messages, max) {
+  const input = messages.map((m, i) => ({ id: i, channel: m.channel, text: m.text }));
+  return [
+    '너는 한국어 뉴스 다이제스트 큐레이터다. 아래는 사용자가 구독한 텔레그램 채널의 최근 메시지다.',
+    '뉴스/정보 가치가 높은 "중요" 메시지만 골라 결과 JSON만 출력한다(코드펜스·설명 금지).',
+    '',
+    `- 중요도 높은 순으로 최대 ${max}개의 id 를 고른다.`,
+    '- 광고/홍보/이벤트/잡담/인사/단순 리액션/중복 메시지는 제외한다.',
+    '- 각 항목을 한국어 한 문장(60자 이내, 따옴표 없이)으로 요약한다.',
+    '- 각 항목의 분야를 cat 으로 표기한다: IT·기술·개발·AI 관련이면 "it", 그 외 증시·투자·경제·부동산 등은 "econ".',
+    '- 고를 만한 게 없으면 items 를 빈 배열로 둔다.',
+    '',
+    '--- 입력 시작 ---',
+    JSON.stringify(input),
+    '--- 입력 끝 ---',
+    '',
+    '출력 형식(이 스키마만): {"items":[{"id":<번호>,"cat":"it"|"econ","summary":"요약"},...]}',
+  ].join('\n');
+}
+
+// 반환: [{ id:number, summary:string }] (중요도순) 또는 실패 시 null
+async function enrichTelegram(messages = [], max = 7) {
+  if (!messages.length) return null;
+  try {
+    const stdout = await runClaude(buildTelegramPrompt(messages, max));
+    const parsed = parseResult(stdout);
+    if (!Array.isArray(parsed.items)) return null;
+    const seen = new Set();
+    const items = parsed.items
+      .filter((it) => it && Number.isInteger(it.id) && it.id >= 0 && it.id < messages.length)
+      .filter((it) => {
+        if (seen.has(it.id)) return false;
+        seen.add(it.id);
+        return true;
+      })
+      .map((it) => ({
+        id: it.id,
+        cat: it.cat === 'it' ? 'it' : 'econ', // 미지정/오류는 경제로 처리(채널 대부분 금융)
+        summary: typeof it.summary === 'string' ? it.summary.trim() : '',
+      }))
+      .slice(0, max);
+    return items.length ? items : null;
+  } catch (err) {
+    console.error(`[텔레그램 보강 실패] ${err?.message ?? err} — 순수 코드로 폴백`);
+    return null;
+  }
+}
+
+module.exports = { enrich, enrichTelegram };

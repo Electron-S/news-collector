@@ -122,20 +122,52 @@ async function main() {
     process.exit(1);
   }
 
-  const chunks = splitByLines(mdToHtml(content), CHUNK_LIMIT);
+  // 같은 파일에 실행 섹션이 누적될 수 있으므로(--force 재수집 등) 가장 최근 실행만 전송한다.
+  const allLines = content.split('\n');
+  let from = 0;
+  for (let i = 0; i < allLines.length; i++) {
+    if (/^##\s+실행:/.test(allLines[i])) from = i;
+  }
+
+  // 카테고리(### …) 경계로 갈라 메시지를 만든다. collect.js 는 IT/경제(+선택 채널) 카테고리를
+  // '### ' 헤더로 출력한다. 헤더 이전의 실행시각(preamble)은 모든 메시지 머리말로 공유.
+  const preamble = [];
+  const blocks = [];
+  for (const line of allLines.slice(from)) {
+    if (/^###\s/.test(line)) blocks.push([line]);
+    else if (blocks.length) blocks[blocks.length - 1].push(line);
+    else preamble.push(line);
+  }
+  const stamp = preamble.join('\n').trim();
+
+  // '### ' 카테고리가 없으면(예: 구버전 리포트) 전체를 단일 메시지로 폴백.
+  const sources = blocks.length ? blocks.map((b) => b.join('\n')) : [content];
+  // 각 카테고리에 시각 머리말을 얹어 standalone 메시지로 만든 뒤 4000자 청크로 분할.
+  const messages = sources.map((md) =>
+    splitByLines(mdToHtml(stamp ? `${stamp}\n\n${md}` : md), CHUNK_LIMIT)
+  );
 
   if (process.argv.includes('--dry-run')) {
-    console.log(`[dry-run] ${chunks.length}개 메시지로 분할됨 (한도 ${CHUNK_LIMIT}자)`);
-    chunks.forEach((c, i) => console.log(`--- chunk ${i + 1} (${c.length}자) ---\n${c}\n`));
+    console.log(`[dry-run] ${messages.length}개 카테고리 메시지 (한도 ${CHUNK_LIMIT}자)`);
+    messages.forEach((chunks, mi) =>
+      chunks.forEach((c, i) =>
+        console.log(`=== 메시지 ${mi + 1} chunk ${i + 1} (${c.length}자) ===\n${c}\n`)
+      )
+    );
     return;
   }
 
   try {
-    for (let i = 0; i < chunks.length; i++) {
-      await sendChunk(chunks[i]);
-      if (i < chunks.length - 1) await sleep(1200); // 연속 전송 레이트리밋 완화
+    let sent = 0;
+    for (const chunks of messages) {
+      // blocks 순서 = collect 출력 순서(IT 먼저, 경제 나중).
+      for (const chunk of chunks) {
+        await sendChunk(chunk);
+        sent++;
+        await sleep(1200); // 연속 전송 레이트리밋 완화
+      }
     }
-    console.log(`Telegram 알림 전송 완료(${chunks.length}개 메시지): ${resolved}`);
+    console.log(`Telegram 알림 전송 완료(${messages.length}개 카테고리, ${sent}개 메시지): ${resolved}`);
   } catch (err) {
     console.error(`Telegram 전송 실패: ${err.message}`);
     process.exit(1);

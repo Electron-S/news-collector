@@ -6,7 +6,8 @@
 const fs = require('fs');
 const path = require('path');
 const cheerio = require('cheerio');
-const { enrich } = require('./enrich');
+const { enrich, enrichTelegram } = require('./enrich');
+const { collectTelegramChannels } = require('./collect-telegram');
 
 const UA =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
@@ -63,7 +64,7 @@ const num = (n) => Number(n).toLocaleString('ko-KR', { maximumFractionDigits: 2 
 const signed = (n) => (n >= 0 ? '+' : '') + num(n);
 
 // ── 1행 요약 ────────────────────────────────────────────────
-// 요약은 각 소스가 제공하는 텍스트(velog short_description, GitHub repo 설명)를
+// 요약은 GitHub repo 설명 등 각 소스가 제공하는 텍스트를
 // 그대로 쓴다. 글 페이지를 따로 fetch 하지 않으므로 요청 수가 적고 안정적이다.
 const SUMMARY_MAX = 100;
 
@@ -73,51 +74,13 @@ const clip = (s, max = SUMMARY_MAX) => {
   return t.length > max ? `${t.slice(0, max).trim()}…` : t;
 };
 
+// 콤마 포함 금융 수치를 숫자로 파싱한다. 빈 값은 NaN 으로 처리해 후속 isFinite 에서 거른다.
+const parsePrice = (v) => {
+  const s = String(v ?? '').replace(/,/g, '').trim();
+  return s === '' ? NaN : Number(s);
+};
+
 // ── 수집기 ──────────────────────────────────────────────────
-
-// velog 트렌딩에서 제외할 주제 키워드(취업·면접·개인 회고/일상 등).
-// IT 기술·경제 주제 위주로 추리기 위함이며, 제목·태그에 매칭한다.
-const VELOG_EXCLUDE = [
-  '면접', '합격', '후기', '회고', '취업', '취준', '자소서', '이력서', '채용',
-  '인턴', '신입', '일기', '일상', '다이어리', '부트캠프', '코딩테스트', '코테',
-  '수강', '졸업', '학점',
-];
-
-function isCareerOrPersonal(post) {
-  const hay = `${post.title} ${(post.tags ?? []).join(' ')}`.toLowerCase();
-  return VELOG_EXCLUDE.some((kw) => hay.includes(kw));
-}
-
-async function collectVelog() {
-  // short_description 를 함께 받아 글 페이지를 따로 fetch 하지 않는다(요청 수·throttle↓).
-  const query =
-    'query{trendingPosts(input:{limit:20,timeframe:"day"}){title url_slug short_description tags user{username}}}';
-  const data = await fetchJson('https://v3.velog.io/graphql', {
-    method: 'POST',
-    // velog API는 브라우저 UA + 대량 요청을 스크래핑으로 보고 차단하므로 비브라우저 UA를 보낸다.
-    headers: { 'Content-Type': 'application/json', 'User-Agent': 'news-collector/1.0' },
-    body: JSON.stringify({ query }),
-  });
-  const posts = data?.data?.trendingPosts ?? [];
-  if (!posts.length) throw new Error('빈 응답');
-  // 후보를 넉넉히 반환하고 최종 5개 선별은 LLM(enrich)이 한다.
-  // 키워드 필터 순서(기술 우선)는 LLM 미사용 시 폴백(앞 5개)용으로 유지한다.
-  const ordered = posts.slice().sort((a, b) => {
-    const aEx = isCareerOrPersonal(a);
-    const bEx = isCareerOrPersonal(b);
-    return aEx === bEx ? 0 : aEx ? 1 : -1;
-  });
-  return ordered
-    .filter((p) => p.user?.username && p.url_slug)
-    .slice(0, 15)
-    .map((p) => ({
-      title: p.title,
-      url: `https://velog.io/@${p.user.username}/${p.url_slug}`,
-      author: p.user.username,
-      summary: clip(p.short_description),
-      tags: p.tags ?? [],
-    }));
-}
 
 async function collectYozm() {
   const html = await fetchText('https://yozm.wishket.com/magazine/');
@@ -136,7 +99,8 @@ async function collectYozm() {
   });
   if (!out.length) throw new Error('기사 없음');
   // 요즘IT는 제목만 표시하므로 요약(og:description)을 가져오지 않는다.
-  return out.slice(0, 5);
+  // 후보를 넉넉히 반환하고 최종 5개(AI 관련도순) 선별은 LLM(enrich)이 한다.
+  return out.slice(0, 15);
 }
 
 async function collectGithub() {
@@ -164,13 +128,11 @@ async function collectNaverIndex(code) {
   if (!d) throw new Error('데이터 없음');
   // raw 등락액·등락률은 이미 부호를 포함한다(예: 하락 시 "-16.57", "-1.82").
   // 부호를 다시 파생하지 말고 그대로 사용한다.
-  const current = Number(d.closePriceRaw ?? String(d.closePrice).replace(/,/g, ''));
-  const diff = Number(
-    d.compareToPreviousClosePriceRaw ?? String(d.compareToPreviousClosePrice).replace(/,/g, '')
-  );
-  const pctRaw = Number(String(d.fluctuationsRatio).replace(/,/g, ''));
+  const current = parsePrice(d.closePriceRaw ?? d.closePrice);
+  const diff = parsePrice(d.compareToPreviousClosePriceRaw ?? d.compareToPreviousClosePrice);
+  const pctRaw = parsePrice(d.fluctuationsRatio);
   // fluctuationsRatio가 절대값으로 오는 경우 diff 부호와 동기화해 상승/하락 방향을 맞춘다.
-  const pct = Math.abs(pctRaw) * Math.sign(diff || 1);
+  const pct = Math.abs(pctRaw) * Math.sign(diff);
   if (!Number.isFinite(current) || !Number.isFinite(diff) || !Number.isFinite(pct))
     throw new Error('값 파싱 실패');
   return { current, diff, pct, marketStatus: d.marketStatus };
@@ -185,9 +147,10 @@ async function collectUsdKrw() {
   return { current: krw, updated: data.time_last_update_utc };
 }
 
-async function collectMarketNews() {
-  // 증권(finance) 피드: 실제 마켓 헤드라인. economy 피드는 기업 PR 위주라 부적합.
-  const xml = await fetchText('https://www.hankyung.com/feed/finance');
+// 한국경제 RSS(<item> 목록)에서 제목·링크를 추출한다. CDATA 래핑을 허용한다.
+// 헤드라인 자체가 한 줄 요약 역할을 하므로 별도 og:description 은 붙이지 않는다.
+async function fetchRssItems(url, limit) {
+  const xml = await fetchText(url);
   const pick = (block, tag) => {
     const m = block.match(
       new RegExp(`<${tag}>(?:<!\\[CDATA\\[)?([\\s\\S]*?)(?:\\]\\]>)?</${tag}>`)
@@ -197,11 +160,57 @@ async function collectMarketNews() {
   const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)]
     .map((m) => ({ title: pick(m[1], 'title'), url: pick(m[1], 'link') }))
     .filter((x) => x.title && x.url)
-    .slice(0, 4);
+    .slice(0, limit);
   if (!items.length) throw new Error('뉴스 없음');
-  // 증권 헤드라인 자체가 한 줄 요약 역할을 한다. 기사 og:description 은
-  // "제목, 기자, 증권" 형태로 제목과 중복되므로 별도 요약을 붙이지 않는다.
   return items;
+}
+
+// 증권(finance) 피드: 실제 마켓 헤드라인. economy 피드는 기업 PR 위주라 부적합.
+const collectMarketNews = () => fetchRssItems('https://www.hankyung.com/feed/finance', 4);
+
+// 지난밤 미국 증시 관련 뉴스: 국제 피드는 일반 세계뉴스(폭염·정치 등)가 섞여 있어,
+// 증시·금융 관련 키워드가 제목에 든 글만 추린다. 매칭이 없으면 빈 배열(헤드라인 생략).
+const US_MARKET_KW = [
+  '뉴욕증시', '나스닥', 'S&P', '다우', '월가', '월스트리트', '연준', '연은', 'Fed', 'FOMC',
+  '금리', '인플레', '국채', '달러', '위안화', '엔화', '환율', '증시', '주가', '스테이블코인',
+  '펀드', '마진', '관세', '반도체', '엔비디아', '마이크론', '상장', 'IPO',
+];
+async function collectGlobalNews() {
+  const items = await fetchRssItems('https://www.hankyung.com/feed/international', 30);
+  return items.filter((n) => US_MARKET_KW.some((kw) => n.title.includes(kw))).slice(0, 3);
+}
+
+// 부동산 뉴스.
+const collectRealEstateNews = () => fetchRssItems('https://www.hankyung.com/feed/realestate', 4);
+
+// 미국 증시 지수: S&P500(.INX)·나스닥(.IXIC)·다우(.DJI).
+// 네이버 해외지수 API. 응답은 국내 지수와 유사하게 콤마 포함 문자열로 오며,
+// 등락액·등락률이 이미 부호를 포함한다(domestic collectNaverIndex 와 동일 패턴).
+async function collectUsIndices() {
+  const SYMS = [
+    ['S&P500', '.INX'],
+    ['나스닥', '.IXIC'],
+    ['다우', '.DJI'],
+  ];
+  const out = [];
+  for (const [name, sym] of SYMS) {
+    try {
+      const d = await fetchJson(`https://api.stock.naver.com/index/${sym}/basic`, {
+        headers: { Referer: 'https://m.stock.naver.com/' },
+      });
+      const current = parsePrice(d?.closePrice);
+      const diff = parsePrice(d?.compareToPreviousClosePrice);
+      const pctRaw = parsePrice(d?.fluctuationsRatio);
+      if (!Number.isFinite(current) || !Number.isFinite(diff) || !Number.isFinite(pctRaw)) continue;
+      // 등락률이 절대값으로 오는 경우 대비, 등락액 부호와 동기화한다.
+      const pct = Math.abs(pctRaw) * Math.sign(diff);
+      out.push({ name, current, diff, pct });
+    } catch (err) {
+      console.warn(`[미국 지수] ${name} 수집 실패: ${err?.message ?? err}`);
+    }
+  }
+  if (!out.length) throw new Error('미국 지수 없음');
+  return out;
 }
 
 // ── 리포트 포맷 ─────────────────────────────────────────────
@@ -213,20 +222,27 @@ function fmtIndex(idx) {
   const summaryLine = (s) => {
     if (s) L.push(`   └ ${s}`);
   };
-
-  L.push('#### Velog 트렌딩 (상위 5개)');
-  if (idx.velog) {
-    idx.velog.forEach((p, i) => {
-      L.push(`${i + 1}. [${p.title}](${p.url}) — ${p.author}`);
-      summaryLine(p.summary);
+  const newsList = (items) => {
+    if (items) items.forEach((n, i) => L.push(`${i + 1}. [${n.title}](${n.url})`));
+    else L.push(FAIL);
+  };
+  // 구독 채널 메시지 소블록(해당 카테고리 메시지에 분산 추가). 항목 없으면 미출력.
+  const tgBlock = (items) => {
+    if (!items?.length) return;
+    L.push('');
+    L.push('#### 📨 구독 채널 주요 소식');
+    items.forEach((m, i) => {
+      L.push(`${i + 1}. ${m.channel}`);
+      L.push(`   └ ${m.summary || m.text} [바로가기](${m.url})`);
     });
-  } else L.push(FAIL);
+  };
+
+  // ── 💻 IT/기술 ──────────────────────────────────────────────
+  L.push('### 💻 IT/기술');
   L.push('');
 
-  L.push('#### 요즘IT 인기 기사 (상위 5개)');
-  if (idx.yozm) {
-    idx.yozm.forEach((a, i) => L.push(`${i + 1}. [${a.title}](${a.url})`));
-  } else L.push(FAIL);
+  L.push('#### 인기 IT 기사 (AI 중심)');
+  newsList(idx.yozm);
   L.push('');
 
   L.push('#### GitHub Trending (당일)');
@@ -236,9 +252,30 @@ function fmtIndex(idx) {
       summaryLine(g.summaryKo || g.desc); // LLM 한글 요약 우선, 없으면 원문 설명
     });
   } else L.push(FAIL);
+  tgBlock(idx.telegramIt);
   L.push('');
 
-  L.push('#### 코스피/코스닥');
+  // ── 📈 경제/투자 ────────────────────────────────────────────
+  L.push('### 📈 경제/투자');
+  L.push('');
+
+  L.push('#### 지난밤 미국 증시');
+  if (idx.usIndices) {
+    idx.usIndices.forEach((d) => {
+      // 미 장 시작 전(프리마켓)에는 당일 등락이 0으로 와서 오해를 부르므로 종가만 표기.
+      const delta =
+        d.diff === 0 && d.pct === 0
+          ? '(전일 종가)'
+          : `(전일 대비 **${signed(d.diff)} (${signed(d.pct)}%)**)`;
+      L.push(`- ${d.name}: **${num(d.current)} pt** ${delta}`);
+    });
+  } else L.push(`- ${FAIL}`);
+  if (idx.globalNews) {
+    idx.globalNews.forEach((n) => L.push(`   · [${n.title}](${n.url})`));
+  }
+  L.push('');
+
+  L.push('#### 국내 지수 (코스피/코스닥)');
   if (idx.kospi) {
     L.push(`- 코스피: **${num(idx.kospi.current)} pt** (전일 대비 **${signed(idx.kospi.diff)} (${signed(idx.kospi.pct)}%)**)`);
   } else L.push(`- 코스피: ${FAIL}`);
@@ -254,11 +291,12 @@ function fmtIndex(idx) {
   L.push('');
 
   L.push('#### 주요 마켓 뉴스 (한국경제 증권)');
-  if (idx.news) {
-    idx.news.forEach((n, i) => {
-      L.push(`${i + 1}. [${n.title}](${n.url})`);
-    });
-  } else L.push(FAIL);
+  newsList(idx.news);
+  L.push('');
+
+  L.push('#### 부동산 뉴스 (한국경제)');
+  newsList(idx.realEstate);
+  tgBlock(idx.telegramEcon);
 
   return L.join('\n');
 }
@@ -288,23 +326,38 @@ async function main() {
 
   // 웹/RSS/금융 소스를 병렬 수집한다(소스가 분산되어 단일 호스트 레이트리밋 영향 없음).
   await Promise.all([
-    run('velog', collectVelog),
     run('yozm', collectYozm),
     run('github', collectGithub),
     run('news', collectMarketNews),
+    run('usIndices', collectUsIndices),
+    run('globalNews', collectGlobalNews),
+    run('realEstate', collectRealEstateNews),
     run('kospi', () => collectNaverIndex('KOSPI')),
     run('kosdaq', () => collectNaverIndex('KOSDAQ')),
     run('usdkrw', collectUsdKrw),
+    run('telegram', collectTelegramChannels), // TG 미설정 시 실패→null(섹션 생략)
   ]);
 
-  // LLM 보강(Claude Code): velog 선별 + GitHub 한글 요약. 실패 시 순수 코드로 폴백.
-  const enriched = await enrich({ velog: idx.velog ?? [], github: idx.github ?? [] });
-  if (idx.velog) {
-    const keep = enriched?.velogKeep;
-    const picked = keep?.length
-      ? [...new Set(keep)].map((i) => idx.velog[i]).filter(Boolean)
-      : idx.velog;
-    idx.velog = picked.slice(0, 5);
+  // LLM 보강(Claude Code): 요즘IT AI 선별 + GitHub 한글 요약. 실패 시 순수 코드로 폴백.
+  const enriched = await enrich({ yozm: idx.yozm ?? [], github: idx.github ?? [] });
+  // keep 목록 순서대로 재정렬 후 상위 5개. keep 이 비면 원본 순서 유지(폴백).
+  const reorder = (list, keep) =>
+    keep?.length
+      ? [...new Set(keep)].map((i) => list[i]).filter(Boolean).slice(0, 5)
+      : list.slice(0, 5);
+  if (idx.yozm) idx.yozm = reorder(idx.yozm, enriched?.yozmKeep);
+
+  // 구독 채널 중요 메시지 선별(LLM): 카테고리(it/econ)와 요약을 받아 두 메시지에 분산.
+  // 실패 시 최신 일부를 경제 카테고리로 폴백.
+  if (idx.telegram?.length) {
+    const picked = await enrichTelegram(idx.telegram, 8);
+    const items = picked
+      ? picked
+          .filter((it) => idx.telegram[it.id])
+          .map((it) => ({ ...idx.telegram[it.id], summary: it.summary, cat: it.cat }))
+      : idx.telegram.slice(0, 7).map((m) => ({ ...m, cat: 'econ' }));
+    idx.telegramIt = items.filter((m) => m.cat === 'it');
+    idx.telegramEcon = items.filter((m) => m.cat !== 'it');
   }
   if (idx.github && enriched?.githubKo) {
     idx.github.forEach((g, i) => {

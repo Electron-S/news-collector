@@ -49,7 +49,15 @@ const clampScore = (v) => {
   return Number.isFinite(n) ? Math.min(10, Math.max(0, n)) : 0;
 };
 
-function buildPrompt(yozm, github, interests) {
+// 피드백 학습 결과(선호/비선호 키워드)를 프롬프트 한 줄로. 비면 빈 문자열.
+function prefsLine(prefer = [], avoid = []) {
+  const parts = [];
+  if (prefer.length) parts.push(`특히 선호(점수 가산): ${prefer.join(', ')}`);
+  if (avoid.length) parts.push(`비선호(점수 감산): ${avoid.join(', ')}`);
+  return parts.join('. ');
+}
+
+function buildPrompt(yozm, github, interests, prefer, avoid) {
   const input = {
     yozm: yozm.map((a, i) => ({ id: i, title: a.title })),
     github: github.map((g, i) => ({ id: i, repo: g.repo, desc: g.desc })),
@@ -58,6 +66,7 @@ function buildPrompt(yozm, github, interests) {
   return [
     '너는 한국어 IT/경제 데일리 다이제스트 큐레이터다. 아래 입력을 보고 결과 JSON만 출력한다(코드펜스·설명 금지).',
     interestLine,
+    prefsLine(prefer, avoid),
     '',
     '1) YOZM 후보(IT 기사) 각각에 0~10 정수 중요도 점수를 매긴다(AI·머신러닝·LLM·생성형AI 관련이면 가산).',
     '   취업/회고/광고/스팸/주제무관 글은 낮은 점수. 점수 높은 순으로 정렬해 반환한다.',
@@ -72,10 +81,10 @@ function buildPrompt(yozm, github, interests) {
 }
 
 // 반환: { yozm: [{id,score}](점수순), githubKo: Record<number,string> } 또는 실패 시 null
-async function enrich({ yozm = [], github = [], interests = [] }) {
+async function enrich({ yozm = [], github = [], interests = [], prefer = [], avoid = [] }) {
   if (!yozm.length && !github.length) return null;
   try {
-    const stdout = await runClaude(buildPrompt(yozm, github, interests));
+    const stdout = await runClaude(buildPrompt(yozm, github, interests, prefer, avoid));
     const parsed = parseResult(stdout);
     const seen = new Set();
     const yozmScored = Array.isArray(parsed.yozm)
@@ -103,34 +112,38 @@ async function enrich({ yozm = [], github = [], interests = [] }) {
 }
 
 // ── 텔레그램 채널 메시지 선별 ───────────────────────────────
-function buildTelegramPrompt(messages, max, interests) {
+const SENTIMENTS = new Set(['bull', 'bear', 'neutral']);
+
+function buildTelegramPrompt(messages, max, interests, prefer, avoid) {
   const input = messages.map((m, i) => ({ id: i, channel: m.channel, text: m.text }));
   const interestLine = interests?.length ? `사용자 관심사: ${interests.join(', ')}. 관심사와 가까울수록 점수를 높인다.` : '';
   return [
     '너는 한국어 뉴스 다이제스트 큐레이터다. 아래는 사용자가 구독한 텔레그램 채널의 최근 메시지다.',
     '뉴스/정보 가치가 높은 "중요" 메시지만 골라 결과 JSON만 출력한다(코드펜스·설명 금지).',
     interestLine,
+    prefsLine(prefer, avoid),
     '',
     `- 중요도 높은 순으로 최대 ${max}개의 id 를 고른다.`,
     '- 광고/홍보/이벤트/잡담/인사/단순 리액션/중복 메시지는 제외한다.',
     '- 각 항목에 0~10 정수 중요도 점수(score)를 매긴다.',
     '- 각 항목을 한국어 한 문장(60자 이내, 따옴표 없이)으로 요약한다.',
     '- 각 항목의 분야를 cat 으로 표기한다: IT·기술·개발·AI 관련이면 "it", 그 외 증시·투자·경제·부동산 등은 "econ".',
+    '- 증시·투자 관련 항목은 시장 영향 방향을 sentiment 로 표기한다: 강세 "bull", 약세 "bear", 중립/불명 "neutral".',
     '- 고를 만한 게 없으면 items 를 빈 배열로 둔다.',
     '',
     '--- 입력 시작 ---',
     JSON.stringify(input),
     '--- 입력 끝 ---',
     '',
-    '출력 형식(이 스키마만): {"items":[{"id":<번호>,"cat":"it"|"econ","score":<0~10>,"summary":"요약"},...]}',
+    '출력 형식(이 스키마만): {"items":[{"id":<번호>,"cat":"it"|"econ","score":<0~10>,"sentiment":"bull"|"bear"|"neutral","summary":"요약"},...]}',
   ].join('\n');
 }
 
-// 반환: [{ id, cat, score, summary }] (중요도순) 또는 실패 시 null
-async function enrichTelegram(messages = [], max = 7, interests = []) {
+// 반환: [{ id, cat, score, sentiment, summary }] (중요도순) 또는 실패 시 null
+async function enrichTelegram(messages = [], max = 7, interests = [], prefer = [], avoid = []) {
   if (!messages.length) return null;
   try {
-    const stdout = await runClaude(buildTelegramPrompt(messages, max, interests));
+    const stdout = await runClaude(buildTelegramPrompt(messages, max, interests, prefer, avoid));
     const parsed = parseResult(stdout);
     if (!Array.isArray(parsed.items)) return null;
     const seen = new Set();
@@ -145,6 +158,7 @@ async function enrichTelegram(messages = [], max = 7, interests = []) {
         id: it.id,
         cat: it.cat === 'it' ? 'it' : 'econ', // 미지정/오류는 경제로 처리(채널 대부분 금융)
         score: clampScore(it.score),
+        sentiment: SENTIMENTS.has(it.sentiment) ? it.sentiment : 'neutral',
         summary: typeof it.summary === 'string' ? it.summary.trim() : '',
       }))
       .slice(0, max);

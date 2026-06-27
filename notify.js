@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { TOKEN, CHAT_ID, http } = require('./lib/telegram');
 const { sleep } = require('./lib/util');
+const state = require('./lib/state');
 
 const API = `https://api.telegram.org/bot${TOKEN}`;
 
@@ -60,8 +61,43 @@ function splitByLines(text, limit) {
   return chunks;
 }
 
+// ── 평가 메시지(P1): 항목별 👍/👎 인라인 버튼 ──────────────
+// votable: [{gid, cat, source, title, url}]. callback_data="v:<YYYYMMDD>:<gid>:u|d".
+function buildEval(votable, dateStr) {
+  const d = dateStr.replace(/-/g, '');
+  const lines = ['<b>📊 오늘 다이제스트 평가</b>', '유용한 항목은 👍, 별로면 👎 (다음 수집부터 학습 반영)', ''];
+  const rows = [];
+  for (const v of votable) {
+    const n = v.gid + 1;
+    const line = `${n}. [${v.cat === 'it' ? 'IT' : '경제'}] ${escapeHtml((v.title || '').slice(0, 40))}`;
+    const candidate = lines.join('\n') + '\n' + line;
+    if (candidate.length > CHUNK_LIMIT) break;
+    lines.push(line);
+    rows.push([
+      { text: `👍 ${n}`, callback_data: `v:${d}:${v.gid}:u` },
+      { text: `👎 ${n}`, callback_data: `v:${d}:${v.gid}:d` },
+    ]);
+  }
+  if (!rows.length) return null;
+  return { text: lines.join('\n'), reply_markup: { inline_keyboard: rows } };
+}
+
+// 리포트 파일 경로에서 평가 후보(state/pending/<date>.json)를 읽는다. 없으면 [].
+function loadVotable(reportPath) {
+  const date = path.basename(reportPath, '.md');
+  try {
+    const arr = JSON.parse(fs.readFileSync(path.join(state.STATE_DIR, 'pending', `${date}.json`), 'utf-8'));
+    return { date, votable: Array.isArray(arr) ? arr : [] };
+  } catch (err) {
+    if (err?.code !== 'ENOENT') {
+      console.warn(`[notify] pending 파일 로드 실패: ${err?.message ?? err}`);
+    }
+    return { date, votable: [] };
+  }
+}
+
 // ── 전송 (재시도 + 429 백오프) ──────────────────────────────
-async function sendChunk(text) {
+async function sendChunk(text, extra = {}) {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
       await http.post(`${API}/sendMessage`, {
@@ -69,6 +105,7 @@ async function sendChunk(text) {
         text,
         parse_mode: 'HTML',
         disable_web_page_preview: true,
+        ...extra,
       });
       return;
     } catch (err) {
@@ -139,6 +176,10 @@ async function main() {
     splitByLines(mdToHtml(stamp ? `${stamp}\n\n${md}` : md), CHUNK_LIMIT)
   );
 
+  // 평가 메시지(P1): pending 후보가 있으면 카테고리 메시지 뒤에 1개 더 보낸다.
+  const { date, votable } = loadVotable(resolved);
+  const evalMsg = votable.length ? buildEval(votable, date) : null;
+
   if (process.argv.includes('--dry-run')) {
     console.log(`[dry-run] ${messages.length}개 카테고리 메시지 (한도 ${CHUNK_LIMIT}자)`);
     messages.forEach((chunks, mi) =>
@@ -146,6 +187,9 @@ async function main() {
         console.log(`=== 메시지 ${mi + 1} chunk ${i + 1} (${c.length}자) ===\n${c}\n`)
       )
     );
+    if (evalMsg) {
+      console.log(`=== 평가 메시지 (버튼 ${evalMsg.reply_markup.inline_keyboard.length}쌍) ===\n${evalMsg.text}\n`);
+    }
     return;
   }
 
@@ -158,6 +202,10 @@ async function main() {
         sent++;
         await sleep(1200); // 연속 전송 레이트리밋 완화
       }
+    }
+    if (evalMsg) {
+      await sendChunk(evalMsg.text, { reply_markup: evalMsg.reply_markup });
+      sent++;
     }
     console.log(`Telegram 알림 전송 완료(${messages.length}개 카테고리, ${sent}개 메시지): ${resolved}`);
   } catch (err) {

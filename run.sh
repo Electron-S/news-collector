@@ -3,6 +3,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# 지난 실행 이후 쌓인 평가(👍/👎) 콜백을 먼저 반영(P1). 실패해도 수집은 진행.
+node feedback.js || true
+
 if REPORT=$(node collect.js); then
   if ! node notify.js "$REPORT"; then
     echo "전송 실패"

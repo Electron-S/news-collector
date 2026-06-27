@@ -51,11 +51,39 @@ test('prune: 윈도우 밖 항목 제거', () => {
   assert.equal(pruned.fresh, now - day);
 });
 
-test('isSeen/markSeen', () => {
+test('isSeen/markSeen: 제목 포함 객체값 저장', () => {
   const seen = {};
   assert.equal(state.isSeen(seen, 'http://x'), false);
-  state.markSeen(seen, 'http://x', 123);
+  state.markSeen(seen, 'http://x', 123, '제목A');
   assert.equal(state.isSeen(seen, 'http://x'), true);
+  assert.deepEqual(seen['http://x'], { t: 123, title: '제목A' });
+});
+
+test('prune: 객체값(신버전)도 시각 기준 유지/제거', () => {
+  const now = 1_000_000_000_000;
+  const day = state.DAY_MS;
+  const seen = {
+    old: { t: now - 10 * day, title: 'old' },
+    fresh: { t: now - day, title: 'fresh' },
+  };
+  const pruned = state.prune(seen, 5, now);
+  assert.equal(pruned.old, undefined);
+  assert.deepEqual(pruned.fresh, { t: now - day, title: 'fresh' });
+});
+
+test('recentTitles: 객체값에서 제목만 추출(빈 제목 제외)', () => {
+  const seen = { a: { t: 1, title: 'AI 뉴스' }, b: { t: 2, title: '' }, c: 12345 };
+  assert.deepEqual(state.recentTitles(seen), ['AI 뉴스']);
+});
+
+test('interestBoost: 매칭·학습가중 반영', () => {
+  // 매칭 없음 → 1.0
+  assert.equal(rank.interestBoost('날씨', ['AI']), 1);
+  // 가중 0 매칭 1건 → 1 + 0.3*1
+  assert.ok(Math.abs(rank.interestBoost('AI 소식', ['AI']) - 1.3) < 1e-9);
+  // 양수 가중 → 보너스↑ , 음수 가중(<-1) → 0으로 바닥
+  assert.ok(rank.interestBoost('AI 소식', ['AI'], { AI: 2 }) > 1.3);
+  assert.equal(rank.interestBoost('AI 소식', ['AI'], { AI: -5 }), 1);
 });
 
 // ── collect (순수 파싱) ─────────────────────────────────────
@@ -115,4 +143,46 @@ test('channelAllowed: deny 우선, allow 비면 전체 허용', () => {
   assert.equal(channelAllowed('묻따방 🐕', { allow: [], deny: ['묻따방'] }), false);
   assert.equal(channelAllowed('잡담방', { allow: ['주식'], deny: [] }), false); // allow 불일치
   assert.equal(channelAllowed('주식 인사이더', { allow: ['주식'], deny: [] }), true);
+});
+
+// ── weekly (순수 함수) ────────────────────────────────────────
+const weekly = require('../weekly');
+
+test('kstDate: YYYY-MM-DD 형식', () => {
+  assert.ok(/^\d{4}-\d{2}-\d{2}$/.test(weekly.kstDate()));
+});
+
+test('boostOf: 키워드·소스 가중 반영', () => {
+  assert.equal(weekly.boostOf({ title: 'AI 소식' }, { kw: { AI: 2 } }), 2);
+  assert.equal(weekly.boostOf({ title: 'AI 소식', source: 's' }, { kw: {}, source: { s: 2 } }), 1); // 소스 가중 0.5배
+  assert.equal(weekly.boostOf({ title: 'AI 소식', source: 's' }, { kw: { AI: 2 }, source: { s: 2 } }), 3); // 2 + 1
+});
+
+test('topByCategory: 카테고리별 상위 N개, URL 중복 제거', () => {
+  const hist = [
+    { category: 'it', title: 'A', url: 'http://a', score: 10 },
+    { category: 'it', title: 'B', url: 'http://a', score: 8 }, // 중복 URL
+    { category: 'econ', title: 'C', url: 'http://c', score: 9 },
+  ];
+  const it = weekly.topByCategory(hist, 'it', {}, 2);
+  assert.equal(it.length, 1);
+  assert.equal(it[0].title, 'A');
+});
+
+test('fmtSection: 항목 있을 때/없을 때', () => {
+  assert.ok(weekly.fmtSection('T', []).includes('없습니다'));
+  const withItem = weekly.fmtSection('T', [{ title: 'A', url: 'http://a', source: 'S' }]);
+  assert.ok(withItem.includes('1. [A](http://a) — S'));
+});
+
+// ── feedback (순수 함수) ──────────────────────────────────────
+const { matchedKeywords, toDash } = require('../feedback');
+
+test('matchedKeywords: 관심 키워드 매칭', () => {
+  assert.deepEqual(matchedKeywords('AI 소식', ['AI', '반도체']), ['AI']);
+  assert.deepEqual(matchedKeywords('날씨', ['AI']), []);
+});
+
+test('toDash: YYYYMMDD → YYYY-MM-DD', () => {
+  assert.equal(toDash('20260115'), '2026-01-15');
 });

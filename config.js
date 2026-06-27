@@ -50,6 +50,12 @@ module.exports = {
 
   // 중복 제거: 최근 N일 내 이미 보낸 URL 은 다시 보내지 않는다.
   dedupWindowDays: 5,
-  // 근접 중복(같은 사건 여러 소스) 제거 임계값(제목 토큰 Jaccard 유사도).
+  // 근접 중복(같은 사건 여러 소스) 제거 임계값(제목 토큰 Jaccard 유사도). 교차일에도 적용.
   nearDupThreshold: 0.6,
+
+  // 피드백 루프(P1): 평가 버튼 최대 항목 수, 학습 가중 감쇠(매 반영 시 ×decay 로 옛 신호 약화).
+  feedback: { enabled: true, maxItems: 12, decay: 0.9 },
+
+  // 주간 리캡(P2): 카테고리별 상위 N개, 집계 윈도우(일).
+  weekly: { topPerCategory: 7, windowDays: 7 },
 };

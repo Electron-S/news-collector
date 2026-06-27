@@ -10,7 +10,10 @@ const { enrich, enrichTelegram } = require('./enrich');
 const { collectTelegramChannels } = require('./collect-telegram');
 const config = require('./config');
 const state = require('./lib/state');
-const { gravityScore, dedupeSimilar, interestHits } = require('./lib/rank');
+const { gravityScore, jaccard, dedupeSimilar, interestBoost } = require('./lib/rank');
+
+const WEIGHTS_FILE = path.join(state.STATE_DIR, 'weights.json');
+const PENDING_DIR = path.join(state.STATE_DIR, 'pending');
 const { clip: clipBase, sleep } = require('./lib/util');
 
 const UA =
@@ -232,18 +235,17 @@ async function collectReddit() {
   return out.filter((h) => Number.isFinite(h.ageHours));
 }
 
-// HN+Reddit 후보를 합쳐 중력점수(+관심 가중)로 랭킹한다. 최종 자르기는 main 이 한다.
-async function collectHnReddit() {
+// HN+Reddit 후보를 합쳐 중력점수(+관심·피드백 가중)로 랭킹한다. 최종 자르기는 main 이 한다.
+async function collectHnReddit(kwWeights = {}) {
   const [hn, rd] = await Promise.all([
     collectHackerNews().catch(() => []),
     collectReddit().catch(() => []),
   ]);
   const all = [...hn, ...rd];
   if (!all.length) throw new Error('HN/Reddit 없음');
-  // 관심 키워드 매칭당 점수 30% 가산(양질 신호 강화).
+  // 인기·시간감쇠(중력) × 관심 가중(피드백 학습 반영).
   for (const it of all) {
-    const base = gravityScore(it.points, it.ageHours);
-    it.score = base * (1 + 0.3 * interestHits(it.title, config.interests));
+    it.score = gravityScore(it.points, it.ageHours) * interestBoost(it.title, config.interests, kwWeights);
   }
   return all.sort((a, b) => b.score - a.score);
 }
@@ -292,12 +294,15 @@ function fmtIndex(idx) {
     else L.push(FAIL);
   };
   // 구독 채널 메시지 소블록(해당 카테고리 메시지에 분산 추가). 항목 없으면 미출력.
-  const tgBlock = (items) => {
+  // withSentiment=true(경제 블록)면 강세/약세/중립을 채널명 앞에 이모지로 표기(P6).
+  const SENT_EMOJI = { bull: '📈', bear: '📉', neutral: '➖' };
+  const tgBlock = (items, withSentiment = false) => {
     if (!items?.length) return;
     L.push('');
     L.push('#### 📨 구독 채널 주요 소식');
     items.forEach((m, i) => {
-      L.push(`${i + 1}. ${m.channel}`);
+      const tag = withSentiment && m.sentiment ? `${SENT_EMOJI[m.sentiment] || ''} ` : '';
+      L.push(`${i + 1}. ${tag}${m.channel}`);
       L.push(`   └ ${m.summary || m.text} [바로가기](${m.url})`);
     });
   };
@@ -369,7 +374,7 @@ function fmtIndex(idx) {
 
   L.push('#### 부동산 뉴스 (한국경제)');
   newsList(idx.realEstate);
-  tgBlock(idx.telegramEcon);
+  tgBlock(idx.telegramEcon, true); // 경제 블록: 감성 태그 표기
 
   return L.join('\n');
 }
@@ -394,6 +399,13 @@ async function main() {
     process.exit(3); // 중복 → 건너뜀
   }
 
+  // 피드백 학습 가중 로드(P1). prefer/avoid 는 LLM 프롬프트에, kw 가중은 HN 랭킹에 반영.
+  const weights = state.loadJson(WEIGHTS_FILE, { kw: {}, source: {} });
+  const kwWeights = weights.kw || {};
+  const kwEntries = Object.entries(kwWeights);
+  const prefer = kwEntries.filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k]) => k);
+  const avoid = kwEntries.filter(([, v]) => v < 0).sort((a, b) => a[1] - b[1]).slice(0, 5).map(([k]) => k);
+
   const idx = {};
   const failures = [];
   const run = async (key, fn) => {
@@ -410,7 +422,7 @@ async function main() {
   await Promise.all([
     run('yozm', collectYozm),
     run('github', collectGithub),
-    run('hnReddit', collectHnReddit),
+    run('hnReddit', () => collectHnReddit(kwWeights)),
     run('news', collectMarketNews),
     run('usIndices', collectUsIndices),
     run('globalNews', collectGlobalNews),
@@ -421,9 +433,13 @@ async function main() {
     run('telegram', collectTelegramChannels), // TG 미설정 시 실패→null(섹션 생략)
   ]);
 
-  // ── 중복 제거: 최근 N일 내 보낸 URL 제외 + 근접 중복(제목 유사) 제거 후 개수 자르기 ──
+  // ── 중복 제거: 최근 N일 보낸 URL 제외 + 근접중복(제목 유사) 제거(단일 실행 내 + 교차일) ──
   const seen = state.prune(state.loadSeen(), config.dedupWindowDays, Date.now());
-  const unseen = (items) => (items || []).filter((it) => it.url && !state.isSeen(seen, it.url));
+  const titlesForDedup = state.recentTitles(seen); // 교차일 근접중복 비교용(P3)
+  const titleFresh = (title) =>
+    !titlesForDedup.some((t) => jaccard(t, title) >= config.nearDupThreshold);
+  const unseen = (items) =>
+    (items || []).filter((it) => it.url && !state.isSeen(seen, it.url) && titleFresh(it.title || ''));
   const dedupNews = (items, n) =>
     dedupeSimilar(unseen(items), (x) => x.title, config.nearDupThreshold).slice(0, n);
 
@@ -440,6 +456,8 @@ async function main() {
     yozm: idx.yozm ?? [],
     github: idx.github ?? [],
     interests: config.interests,
+    prefer,
+    avoid,
   });
   if (idx.yozm) {
     const cand = idx.yozm;
@@ -447,7 +465,7 @@ async function main() {
     idx.yozm = picks?.length
       ? picks
           .filter((p) => p.score >= config.scoreThreshold && cand[p.id])
-          .map((p) => cand[p.id])
+          .map((p) => ({ ...cand[p.id], score: p.score })) // 점수 부착(주간 리캡용)
           .slice(0, config.counts.yozm)
       : cand.slice(0, config.counts.yozm); // 폴백: 원본 순서
   }
@@ -462,12 +480,12 @@ async function main() {
   // ── 구독 채널 중요 메시지: LLM 점수·분류(it/econ)·요약 → 임계값 통과분만 두 메시지로 분산 ──
   if (idx.telegram?.length) {
     const cand = idx.telegram;
-    const picked = await enrichTelegram(cand, config.counts.telegram, config.interests);
+    const picked = await enrichTelegram(cand, config.counts.telegram, config.interests, prefer, avoid);
     const items = picked
       ? picked
           .filter((it) => it.score >= config.scoreThreshold && cand[it.id])
-          .map((it) => ({ ...cand[it.id], summary: it.summary, cat: it.cat }))
-      : cand.slice(0, config.counts.telegram).map((m) => ({ ...m, cat: 'econ' }));
+          .map((it) => ({ ...cand[it.id], summary: it.summary, cat: it.cat, sentiment: it.sentiment, score: it.score }))
+      : cand.slice(0, config.counts.telegram).map((m) => ({ ...m, cat: 'econ', sentiment: 'neutral', score: 0 }));
     idx.telegramIt = items.filter((m) => m.cat === 'it');
     idx.telegramEcon = items.filter((m) => m.cat !== 'it');
   }
@@ -490,18 +508,50 @@ async function main() {
     fs.appendFileSync(file, section);
   }
 
-  // ── 상태 갱신: 이번에 노출한 URL 을 seen 에 기록(다음 실행부터 중복 제외) ──
-  const shown = [
-    idx.yozm, idx.github, idx.news, idx.globalNews, idx.realEstate,
-    idx.hnReddit, idx.telegramIt, idx.telegramEcon,
+  // ── 상태 갱신: 노출 항목을 seen(중복) + history(주간 리캡) 에 기록 ──
+  // 각 항목을 {category, source, title, url, score} 로 정규화한다.
+  const norm = (it, category) => ({
+    category,
+    source: it.source || it.channel || (it.repo ? 'GitHub' : ''),
+    title: it.title || it.summary || it.repo || '',
+    url: it.url,
+    score: Number(it.score) || 0,
+  });
+  const shownIt = [
+    ...(idx.yozm || []).map((x) => norm(x, 'it')),
+    ...(idx.github || []).map((x) => norm(x, 'it')),
+    ...(idx.hnReddit || []).map((x) => norm(x, 'it')),
+    ...(idx.telegramIt || []).map((x) => norm(x, 'it')),
   ];
+  const shownEcon = [
+    ...(idx.news || []).map((x) => norm(x, 'econ')),
+    ...(idx.globalNews || []).map((x) => norm(x, 'econ')),
+    ...(idx.realEstate || []).map((x) => norm(x, 'econ')),
+    ...(idx.telegramEcon || []).map((x) => norm(x, 'econ')),
+  ];
+  const allShown = [...shownIt, ...shownEcon];
   const now = Date.now();
-  for (const list of shown) {
-    for (const it of list || []) {
-      if (it?.url) state.markSeen(seen, it.url, now);
-    }
+  for (const it of allShown) {
+    if (it.url) state.markSeen(seen, it.url, now, it.title);
   }
   state.saveSeen(seen);
+  for (const it of allShown) {
+    if (it.url) state.appendHistory({ ts: now, date, ...it }); // P2 이력
+  }
+  state.trimHistory(30, now);
+
+  // ── 평가 후보 저장(P1): 텔레그램에서 👍/👎 받을 항목. feedback.js 가 다음 실행 때 소비 ──
+  if (config.feedback?.enabled) {
+    const votable = [
+      ...(idx.yozm || []).map((x) => ({ cat: 'it', source: 'yozm', title: x.title, url: x.url })),
+      ...(idx.hnReddit || []).map((x) => ({ cat: 'it', source: x.source, title: x.title, url: x.url })),
+      ...(idx.telegramIt || []).map((x) => ({ cat: 'it', source: x.channel, title: x.summary || x.text, url: x.url })),
+      ...(idx.telegramEcon || []).map((x) => ({ cat: 'econ', source: x.channel, title: x.summary || x.text, url: x.url })),
+    ]
+      .slice(0, config.feedback.maxItems)
+      .map((v, gid) => ({ gid, ...v }));
+    if (votable.length) state.saveJson(path.join(PENDING_DIR, `${date}.json`), votable);
+  }
 
   // 성공 시 마지막 줄에 리포트 경로를 출력한다 (실행 스크립트가 이를 사용).
   process.stdout.write(file + '\n');

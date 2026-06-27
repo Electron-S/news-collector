@@ -14,7 +14,7 @@ const { clip } = require('./lib/util');
 const HOURS = Number(process.env.TG_HOURS || 24); // 최근 N시간 메시지만
 const PER_CHANNEL = Number(process.env.TG_PER_CHANNEL || 20); // 채널당 최대 조회 수
 const MAX_MESSAGES = Number(process.env.TG_MAX_MESSAGES || 60); // 전체 상한(LLM 입력 보호)
-const TEXT_MAX = 300; // 메시지 본문 보관 길이
+const TEXT_MAX = 600; // 메시지 본문 보관 길이(LLM 요약 입력 — 이메일은 길이 제약이 없어 넉넉히)
 
 // config.telegramChannels allow/deny 규칙으로 채널 제목을 거른다(부분일치, 대소문자 무시).
 // deny 우선, allow 가 비어 있으면 전체 허용. 순수 함수(테스트 용이).

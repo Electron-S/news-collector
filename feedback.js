@@ -1,101 +1,112 @@
 'use strict';
 
-// P1 피드백 수신: 텔레그램 평가 버튼(👍/👎) 콜백을 getUpdates 로 수거해
-// 선호 키워드·소스 가중치(state/weights.json)를 학습한다. cron 에서 collect 前에 실행한다.
-// 데몬이 아니라 실행 시점 폴링이므로, 어제 누른 평가가 다음 실행 때 반영된다.
+// 피드백: 주간 설문(Google 폼) 응답을 읽어 관심/비관심 키워드를 학습 가중(state/weights.json)에 반영.
+// 폼 응답 시트를 '웹에 게시(CSV)'한 공개 URL(config.feedback.responsesCsvUrl)을 인증 없이 읽는다.
+// run.sh 에서 collect 前에 실행한다. 미설정이면 아무 것도 하지 않는다(이메일 푸터 링크만 노출).
 
 require('dotenv').config();
 const path = require('path');
-const { TOKEN, CHAT_ID, http } = require('./lib/telegram');
 const config = require('./config');
 const state = require('./lib/state');
 
-const API = `https://api.telegram.org/bot${TOKEN}`;
-const OFFSET_FILE = path.join(state.STATE_DIR, 'tg-offset.json');
 const WEIGHTS_FILE = path.join(state.STATE_DIR, 'weights.json');
-const PENDING_DIR = path.join(state.STATE_DIR, 'pending');
+const SURVEY_FILE = path.join(state.STATE_DIR, 'feedback-survey.json');
 
-// 콜백 date(YYYYMMDD) → pending 파일명(YYYY-MM-DD).
-const toDash = (d) => `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`;
+// 최소 CSV 파서(따옴표·임베디드 콤마/개행 처리). 순수 함수.
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let cell = '';
+  let inQ = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQ) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { cell += '"'; i++; } else inQ = false;
+      } else cell += c;
+    } else if (c === '"') inQ = true;
+    else if (c === ',') { row.push(cell); cell = ''; }
+    else if (c === '\n') { row.push(cell); rows.push(row); row = []; cell = ''; }
+    else if (c !== '\r') cell += c;
+  }
+  if (cell.length || row.length) { row.push(cell); rows.push(row); }
+  return rows;
+}
 
-// 제목에서 관심 키워드(config.interests) 매칭분 추출.
-function matchedKeywords(title) {
-  const hay = String(title ?? '').toLowerCase();
-  return config.interests.filter((kw) => hay.includes(String(kw).toLowerCase()));
+// 셀 값(체크박스 다중선택은 "A, B" 형태)을 config.interests 와 매칭되는 키워드로.
+function matchedInterests(cellValue, interests) {
+  const vals = String(cellValue ?? '').split(/[,;]/).map((s) => s.trim()).filter(Boolean);
+  const out = [];
+  for (const v of vals) {
+    const kw = interests.find((k) => k.toLowerCase() === v.toLowerCase());
+    if (kw && !out.includes(kw)) out.push(kw);
+  }
+  return out;
+}
+
+// 헤더에서 관심/비관심 컬럼 인덱스를 찾는다.
+function findColumns(header) {
+  const interest = header.findIndex((h) => /관심/.test(h) && !/없|비관심|제외/.test(h));
+  const avoid = header.findIndex((h) => /비관심|관심\s*없|관심없|제외/.test(h));
+  return { interest, avoid };
+}
+
+// 최신 응답 1건을 weights 에 반영(순수). 관심=+boost, 비관심=-boost.
+function applySurveyRow(header, lastRow, weights, interests, boost) {
+  const { interest, avoid } = findColumns(header);
+  const next = { kw: { ...(weights.kw || {}) } };
+  const bump = (list, sign) => {
+    for (const kw of list) next.kw[kw] = (next.kw[kw] || 0) + sign * boost;
+  };
+  if (interest >= 0 && interest < lastRow.length) bump(matchedInterests(lastRow[interest], interests), 1);
+  if (avoid >= 0 && avoid < lastRow.length) bump(matchedInterests(lastRow[avoid], interests), -1);
+  return next;
 }
 
 async function main() {
-  if (!TOKEN || !CHAT_ID || !config.feedback?.enabled) return;
+  const url = config.feedback?.responsesCsvUrl;
+  if (!config.feedback?.enabled || !url) return; // 미설정 → idle
 
-  const offsetState = state.loadJson(OFFSET_FILE, { offset: 0 });
-  let updates;
+  let text;
   try {
-    const res = await http.post(`${API}/getUpdates`, {
-      offset: offsetState.offset || 0,
-      timeout: 0,
-      allowed_updates: ['callback_query'],
-    });
-    updates = res.data?.result ?? [];
+    const res = await fetch(url, { signal: AbortSignal.timeout(12000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    text = await res.text();
   } catch (err) {
-    // 웹훅이 설정돼 있으면 409. 폴링 불가 → 조용히 종료(수집은 계속).
-    const status = err.response?.status;
-    console.error(`[피드백] getUpdates 실패(${status ?? err.code}) — 건너뜀`);
+    console.error(`[피드백] 설문 CSV 로드 실패: ${err?.message ?? err}`);
     return;
   }
-  if (!updates.length) return;
 
-  const weights = state.loadJson(WEIGHTS_FILE, { kw: {}, source: {} });
+  const rows = parseCsv(text).filter((r) => r.some((c) => c.trim()));
+  if (rows.length < 2) return; // 헤더만 있거나 빈 응답
+  const header = rows[0];
+  const lastRow = rows[rows.length - 1];
+
+  // 동일 응답 재적용 방지(첫 칸=타임스탬프 기준).
+  const surveyState = state.loadJson(SURVEY_FILE, { lastTs: '' });
+  const ts = lastRow[0] || '';
+  if (ts && ts === surveyState.lastTs) return;
+
+  let weights = state.loadJson(WEIGHTS_FILE, { kw: {}, source: {} });
   weights.kw = weights.kw || {};
-  weights.source = weights.source || {};
-
-  // 활동이 있으면 옛 신호를 살짝 감쇠(최근 선호 우선).
+  // 새 응답 반영 전 옛 신호 감쇠.
   const decay = config.feedback.decay ?? 0.9;
-  for (const obj of [weights.kw, weights.source]) {
-    for (const k of Object.keys(obj)) {
-      obj[k] *= decay;
-      if (Math.abs(obj[k]) < 0.05) delete obj[k]; // 0 근처는 정리
-    }
+  for (const k of Object.keys(weights.kw)) {
+    weights.kw[k] *= decay;
+    if (Math.abs(weights.kw[k]) < 0.05) delete weights.kw[k];
   }
-
-  const pendingCache = {};
-  let maxId = offsetState.offset || 0;
-  let applied = 0;
-
-  for (const u of updates) {
-    maxId = Math.max(maxId, u.update_id + 1);
-    const cq = u.callback_query;
-    if (!cq?.data) continue;
-    await http.post(`${API}/answerCallbackQuery`, { callback_query_id: cq.id, text: '반영됨 👍' }).catch((err) => {
-      console.error(`[피드백] answerCallbackQuery 실패: ${err?.message ?? err}`);
-    });
-
-    const m = /^v:(\d{8}):(\d+):(u|d)$/.exec(cq.data);
-    if (!m) continue;
-    const [, d, gidStr, dir] = m;
-    const date = toDash(d);
-    if (!pendingCache[date]) {
-      pendingCache[date] = state.loadJson(path.join(PENDING_DIR, `${date}.json`), []);
-    }
-    const item = pendingCache[date][Number(gidStr)];
-    if (!item) continue;
-
-    const delta = dir === 'u' ? 1 : -1;
-    for (const kw of matchedKeywords(item.title)) {
-      weights.kw[kw] = (weights.kw[kw] || 0) + delta;
-    }
-    if (item.source) weights.source[item.source] = (weights.source[item.source] || 0) + delta;
-    applied++;
-  }
+  weights = applySurveyRow(header, lastRow, weights, config.interests, 2);
 
   state.saveJson(WEIGHTS_FILE, weights);
-  state.saveJson(OFFSET_FILE, { offset: maxId });
-  console.error(`[피드백] 콜백 ${updates.length}건 처리, ${applied}건 반영.`);
+  state.saveJson(SURVEY_FILE, { lastTs: ts });
+  console.error('[피드백] 설문 응답 반영 완료.');
 }
 
 if (require.main === module) {
   main().catch((err) => {
     console.error(`[피드백] 오류: ${err?.message ?? err}`);
-    process.exit(0); // 실패해도 수집 파이프라인은 계속되도록 0 종료
+    process.exit(0);
   });
 }
-module.exports = { matchedKeywords, toDash };
+
+module.exports = { parseCsv, matchedInterests, findColumns, applySurveyRow };

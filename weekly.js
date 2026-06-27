@@ -1,7 +1,7 @@
 'use strict';
 
 // P2 주간 리캡: 최근 N일 history 에서 카테고리별 상위 항목을 모아 리포트로 만들고 전송한다.
-// 점수 = 수집 당시 점수(LLM/중력) + 피드백 학습 가중(👍 키워드/소스). 월요일 cron 에서 실행.
+// 점수 = 수집 당시 점수(LLM/중력) + 피드백 학습 가중. 월요일 cron 에서 실행.
 
 const fs = require('fs');
 const path = require('path');
@@ -84,8 +84,8 @@ function main() {
 
   fs.writeFileSync(file, `# 주간 뉴스 리캡 - ${date}\n\n${body}`);
 
-  // 전송 로직 재사용: notify.js 에 위임(평가 버튼은 pending 파일이 없으므로 미출력).
-  const child = execFile('node', [path.join(__dirname, 'notify.js'), file], (err, stdout, stderr) => {
+  // 전송 로직 재사용: mailer.js 에 위임(이메일 발송).
+  const child = execFile('node', [path.join(__dirname, 'mailer.js'), file], (err, stdout, stderr) => {
     if (stdout) process.stdout.write(stdout);
     if (stderr) process.stderr.write(stderr);
     if (err) process.exit(1);

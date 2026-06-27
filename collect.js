@@ -13,7 +13,6 @@ const state = require('./lib/state');
 const { gravityScore, jaccard, dedupeSimilar, interestBoost } = require('./lib/rank');
 
 const WEIGHTS_FILE = path.join(state.STATE_DIR, 'weights.json');
-const PENDING_DIR = path.join(state.STATE_DIR, 'pending');
 const { clip: clipBase, sleep } = require('./lib/util');
 
 const UA =
@@ -539,19 +538,6 @@ async function main() {
     if (it.url) state.appendHistory({ ts: now, date, ...it }); // P2 이력
   }
   state.trimHistory(30, now);
-
-  // ── 평가 후보 저장(P1): 텔레그램에서 👍/👎 받을 항목. feedback.js 가 다음 실행 때 소비 ──
-  if (config.feedback?.enabled) {
-    const votable = [
-      ...(idx.yozm || []).map((x) => ({ cat: 'it', source: 'yozm', title: x.title, url: x.url })),
-      ...(idx.hnReddit || []).map((x) => ({ cat: 'it', source: x.source, title: x.title, url: x.url })),
-      ...(idx.telegramIt || []).map((x) => ({ cat: 'it', source: x.channel, title: x.summary || x.text, url: x.url })),
-      ...(idx.telegramEcon || []).map((x) => ({ cat: 'econ', source: x.channel, title: x.summary || x.text, url: x.url })),
-    ]
-      .slice(0, config.feedback.maxItems)
-      .map((v, gid) => ({ gid, ...v }));
-    if (votable.length) state.saveJson(path.join(PENDING_DIR, `${date}.json`), votable);
-  }
 
   // 성공 시 마지막 줄에 리포트 경로를 출력한다 (실행 스크립트가 이를 사용).
   process.stdout.write(file + '\n');

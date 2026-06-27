@@ -17,7 +17,7 @@ jobs:
       - run: npm ci
       - name: Syntax check
         run: |
-          for f in collect.js notify.js enrich.js collect-telegram.js alert.js config.js lib/*.js test/*.js; do
+          for f in collect.js mailer.js feedback.js weekly.js enrich.js collect-telegram.js alert.js config.js lib/*.js test/*.js; do
             node -c "$f"
           done
       - name: Unit tests

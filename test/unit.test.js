@@ -9,7 +9,7 @@ const assert = require('node:assert/strict');
 const rank = require('../lib/rank');
 const state = require('../lib/state');
 const { parsePrice, parseRssItems, fmtIndex } = require('../collect');
-const { mdToHtml, splitByLines } = require('../notify');
+const { renderEmail, inlineHtml } = require('../mailer');
 const { channelAllowed } = require('../collect-telegram');
 
 // ── lib/rank ────────────────────────────────────────────────
@@ -122,19 +122,29 @@ test('fmtIndex: hnReddit 섹션 및 포맷', () => {
   assert.ok(out.includes('HN ▲42·💬5'));
 });
 
-// ── notify (마크다운 → 텔레그램 HTML) ───────────────────────
-test('mdToHtml: 헤더·굵게·링크·이스케이프', () => {
-  assert.equal(mdToHtml('### 제목'), '<b>제목</b>');
-  assert.equal(mdToHtml('**굵게**'), '<b>굵게</b>');
-  assert.equal(mdToHtml('[텍스트](https://e.com)'), '<a href="https://e.com">텍스트</a>');
-  assert.equal(mdToHtml('a < b & c'), 'a &lt; b &amp; c');
+// ── mailer (마크다운 → 이메일 HTML) ─────────────────────────
+test('inlineHtml: 굵게·링크·이스케이프', () => {
+  assert.equal(inlineHtml('**굵게**'), '<strong>굵게</strong>');
+  assert.ok(inlineHtml('[텍스트](https://e.com)').includes('<a href="https://e.com"'));
+  assert.ok(inlineHtml('a < b & c').startsWith('a &lt; b &amp; c'));
 });
 
-test('splitByLines: 한도 초과 시 분할', () => {
-  const text = ['aaaa', 'bbbb', 'cccc'].join('\n');
-  const chunks = splitByLines(text, 9); // 한 줄(4) + \n + 한 줄(4) = 9
-  assert.ok(chunks.length >= 2);
-  assert.ok(chunks.every((c) => c.length <= 9));
+test('renderEmail: 최근 실행 섹션·헤더·링크·푸터', () => {
+  const md = [
+    '# 뉴스 수집 리포트 - 2026-06-27',
+    '## 실행: 2026-06-27 (취득 시각: 09:00 KST)',
+    '### 💻 IT/기술',
+    '#### 인기 IT 기사',
+    '1. [제목A](https://a.com)',
+    '### 📈 경제/투자',
+    '#### 지난밤 미국 증시',
+    '- S&P500: **7,000 pt**',
+  ].join('\n');
+  const html = renderEmail(md, { surveyUrl: 'https://form', generatedAt: 'now' });
+  assert.ok(html.includes('IT/기술') && html.includes('경제/투자'));
+  assert.ok(html.includes('<a href="https://a.com"'));
+  assert.ok(html.includes('<strong>7,000 pt</strong>'));
+  assert.ok(html.includes('https://form')); // 설문 링크 푸터
 });
 
 // ── collect-telegram (채널 allow/deny) ──────────────────────
@@ -175,14 +185,30 @@ test('fmtSection: 항목 있을 때/없을 때', () => {
   assert.ok(withItem.includes('1. [A](http://a) — S'));
 });
 
-// ── feedback (순수 함수) ──────────────────────────────────────
-const { matchedKeywords, toDash } = require('../feedback');
+// ── feedback (설문 CSV 순수 함수) ─────────────────────────────
+const { parseCsv, matchedInterests, findColumns, applySurveyRow } = require('../feedback');
 
-test('matchedKeywords: 관심 키워드 매칭', () => {
-  assert.deepEqual(matchedKeywords('AI 소식', ['AI', '반도체']), ['AI']);
-  assert.deepEqual(matchedKeywords('날씨', ['AI']), []);
+test('parseCsv: 따옴표·임베디드 콤마 처리', () => {
+  const rows = parseCsv('Timestamp,관심 주제,비관심 주제\n2026,"AI, 반도체",부동산\n');
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows[1], ['2026', 'AI, 반도체', '부동산']);
 });
 
-test('toDash: YYYYMMDD → YYYY-MM-DD', () => {
-  assert.equal(toDash('20260115'), '2026-01-15');
+test('matchedInterests: config 관심사와 매칭(다중선택)', () => {
+  assert.deepEqual(matchedInterests('AI, 반도체', ['AI', '반도체', '환율']), ['AI', '반도체']);
+  assert.deepEqual(matchedInterests('날씨', ['AI']), []);
+});
+
+test('findColumns: 관심/비관심 컬럼 탐지', () => {
+  const { interest, avoid } = findColumns(['Timestamp', '관심 주제', '비관심 주제']);
+  assert.equal(interest, 1);
+  assert.equal(avoid, 2);
+});
+
+test('applySurveyRow: 관심=+, 비관심=- 가중', () => {
+  const header = ['ts', '관심 주제', '비관심 주제'];
+  const row = ['2026', 'AI', '부동산'];
+  const w = applySurveyRow(header, row, { kw: {} }, ['AI', '부동산'], 2);
+  assert.equal(w.kw.AI, 2);
+  assert.equal(w.kw['부동산'], -2);
 });

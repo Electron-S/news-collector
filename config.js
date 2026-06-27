@@ -53,9 +53,14 @@ module.exports = {
   // 근접 중복(같은 사건 여러 소스) 제거 임계값(제목 토큰 Jaccard 유사도). 교차일에도 적용.
   nearDupThreshold: 0.6,
 
-  // 피드백 루프(P1): 평가 버튼 최대 항목 수, 학습 가중 감쇠(매 반영 시 ×decay 로 옛 신호 약화).
-  feedback: { enabled: true, maxItems: 12, decay: 0.9 },
+  // 피드백: 주간 설문 링크 기반(이메일 전송이라 인터랙티브 버튼 불가).
+  // surveyUrl = 이메일 푸터에 노출할 Google 폼 등 링크.
+  // responsesCsvUrl = (선택) 폼 응답 시트를 '웹에 CSV 게시'한 공개 URL. 설정 시 feedback.js 가 읽어 학습.
+  feedback: { enabled: true, decay: 0.9, surveyUrl: '', responsesCsvUrl: '' },
 
   // 주간 리캡(P2): 카테고리별 상위 N개, 집계 윈도우(일).
   weekly: { topPerCategory: 7, windowDays: 7 },
+
+  // 이메일 제목 접두.
+  mail: { subjectPrefix: '📰 뉴스 다이제스트' },
 };

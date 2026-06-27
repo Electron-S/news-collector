@@ -1,21 +1,21 @@
 {
   "name": "news-collector",
   "version": "1.0.0",
-  "description": "뉴스 수집 + Telegram 알림",
+  "description": "뉴스 수집 + 이메일 다이제스트",
   "private": true,
   "engines": {
     "node": ">=18.0.0"
   },
   "scripts": {
     "collect": "node collect.js",
-    "notify": "node notify.js",
+    "mail": "node mailer.js",
     "start": "bash run.sh",
     "test": "node --test"
   },
   "dependencies": {
-    "axios": "^1.15.0",
     "cheerio": "^1.2.0",
     "dotenv": "^16.4.0",
+    "nodemailer": "^9.0.1",
     "telegram": "^2.26.22"
   }
 }

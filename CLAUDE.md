@@ -24,14 +24,21 @@
 REPORT=$(node collect.js) && node notify.js "$REPORT"
 ```
 
+## 설정 (config.js)
+
+소스·개수·임계값·관심사·중복제거 윈도우를 **`config.js` 한 곳**에 모았다. 소스를 늘리거나
+필터를 바꿀 땐 코드가 아니라 `config.js`만 수정한다(피드 URL, 섹션별 개수, 채널 allow/deny,
+`scoreThreshold`, `interests`, `dedupWindowDays`, `nearDupThreshold`).
+
 ## 수집 항목 (collect.js 가 처리)
 
-데이터 취득은 코드로(환각 없음), 보강(번역·선별)만 LLM이 한다.
+데이터 취득은 코드로(환각 없음), 보강(번역·선별·점수)만 LLM이 한다.
 리포트는 **💻 IT/기술** 과 **📈 경제/투자** 두 카테고리(`### ` 헤더)로 나뉜다.
 
 ### 💻 IT/기술
-- 인기 IT 기사 5개 (yozm.wishket.com) — 후보 중 **AI 관련도 높은 순**으로 LLM이 선별
+- 인기 IT 기사 5개 (yozm.wishket.com) — LLM이 0~10 **중요도 점수**(AI·관심사 가중)로 선별, `scoreThreshold` 미만 제외
 - GitHub Trending 5개 — 기능을 LLM이 한국어 1줄로 요약 (github.com/trending)
+- 해외 IT 토픽 (Hacker News) — Algolia front_page 를 **중력점수**(인기·시간감쇠)+관심 가중으로 코드 랭킹(영문 제목, LLM 미사용). Reddit 은 OAuth 필요로 기본 비활성
 - (TG 설정 시) 구독 채널 주요 소식 중 **IT/기술 분류** 메시지
 
 ### 📈 경제/투자
@@ -51,11 +58,19 @@ REPORT=$(node collect.js) && node notify.js "$REPORT"
 ## LLM 보강 (enrich.js)
 
 `claude -p`(헤드리스 Claude Code, 모델 `claude-sonnet-4-6`)를 호출해
-① 요즘IT 후보를 AI 관련도 높은 순으로 재정렬·선별,
+① 요즘IT 후보에 0~10 중요도 점수를 매겨 정렬(관심사 가중),
 ② GitHub repo 설명을 한국어 1줄로 요약한다(①~②는 1회 호출).
-③ (TG 설정 시) 구독 채널 메시지 중 중요한 것만 선별·요약하고 IT/경제로 분류한다(`enrichTelegram`, 별도 1회 호출).
-LLM 호출이 실패하면 순수 코드로 폴백한다(원본 순서 유지·GitHub 원문 설명·채널 최신 일부는 경제로).
+③ (TG 설정 시) 구독 채널 메시지에 점수·요약·IT/경제 분류를 매긴다(`enrichTelegram`, 별도 1회 호출).
+프롬프트는 **stdin 으로 전달**한다(긴 텔레그램 입력의 argv 한계·실패 방지).
+LLM 호출이 실패하면 순수 코드로 폴백한다(원본 순서·GitHub 원문 설명·채널 최신 일부는 경제로).
 모델은 `NEWS_LLM_MODEL` 환경변수로 바꿀 수 있다.
+
+## 품질·신뢰성 장치
+
+- **중복 제거(state/seen.json)**: 최근 `dedupWindowDays` 일 내 보낸 URL 은 다시 보내지 않는다. 같은 사건이 여러 소스에 겹치면 제목 유사도(`nearDupThreshold`)로 근접 중복도 제거한다. `state/` 는 git 비추적.
+- **점수 임계값**: LLM 0~10 점수로 `scoreThreshold` 미만은 노출하지 않아 조용한 날엔 적게 나간다.
+- **실패 알림**: 핵심 소스 실패 시 메시지 상단에 `⚠️ 일부 수집 실패: …` 표기. 수집 크래시·전송 실패 등 하드 실패는 `run.sh` 가 `alert.js` 로 텔레그램 관리자 알림을 보낸다.
+- **테스트/CI**: 순수 함수 단위테스트(`node --test`, `test/unit.test.js`)와 GitHub Actions(`.github/workflows/ci.yml`)로 회귀를 막는다.
 
 ## 출력 포맷
 

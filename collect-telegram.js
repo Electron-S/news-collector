@@ -8,16 +8,23 @@
 require('dotenv').config();
 const { TelegramClient } = require('telegram');
 const { StringSession } = require('telegram/sessions');
+const config = require('./config');
+const { clip } = require('./lib/util');
 
-const HOURS = Number(process.env.TG_HOURS ?? 24); // 최근 N시간 메시지만
-const PER_CHANNEL = Number(process.env.TG_PER_CHANNEL ?? 20); // 채널당 최대 조회 수
-const MAX_MESSAGES = Number(process.env.TG_MAX_MESSAGES ?? 60); // 전체 상한(LLM 입력 보호)
+const HOURS = Number(process.env.TG_HOURS || 24); // 최근 N시간 메시지만
+const PER_CHANNEL = Number(process.env.TG_PER_CHANNEL || 20); // 채널당 최대 조회 수
+const MAX_MESSAGES = Number(process.env.TG_MAX_MESSAGES || 60); // 전체 상한(LLM 입력 보호)
 const TEXT_MAX = 300; // 메시지 본문 보관 길이
 
-const clip = (s, max) => {
-  const t = String(s ?? '').replace(/\s+/g, ' ').trim();
-  return t.length > max ? `${t.slice(0, max).trim()}…` : t;
-};
+// config.telegramChannels allow/deny 규칙으로 채널 제목을 거른다(부분일치, 대소문자 무시).
+// deny 우선, allow 가 비어 있으면 전체 허용. 순수 함수(테스트 용이).
+function channelAllowed(title, rules = {}) {
+  const t = String(title ?? '').toLowerCase();
+  const { allow = [], deny = [] } = rules;
+  if (deny.some((kw) => t.includes(String(kw).toLowerCase()))) return false;
+  if (allow.length && !allow.some((kw) => t.includes(String(kw).toLowerCase()))) return false;
+  return true;
+}
 
 // 반환: [{ channel, text, url, date(unix s), views }] (최신순), 미설정 시 throw.
 async function collectTelegramChannels() {
@@ -54,6 +61,7 @@ async function collectTelegramChannels() {
       if (!d.isChannel || !ent || ent.megagroup) continue;
 
       const title = ent.title || ent.username || '채널';
+      if (!channelAllowed(title, config.telegramChannels)) continue; // allow/deny 필터
       let msgs = [];
       try {
         msgs = await client.getMessages(ent, { limit: PER_CHANNEL });
@@ -80,7 +88,7 @@ async function collectTelegramChannels() {
       }
     }
   } finally {
-    if (client) await client.disconnect().catch(() => {});
+    if (client) await client.disconnect().catch((err) => { console.warn('[텔레그램] disconnect 실패:', err?.message ?? err); });
   }
 
   if (!out.length) throw new Error('최근 채널 메시지 없음');
@@ -88,4 +96,4 @@ async function collectTelegramChannels() {
   return out;
 }
 
-module.exports = { collectTelegramChannels };
+module.exports = { collectTelegramChannels, channelAllowed };

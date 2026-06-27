@@ -8,6 +8,10 @@ const path = require('path');
 const cheerio = require('cheerio');
 const { enrich, enrichTelegram } = require('./enrich');
 const { collectTelegramChannels } = require('./collect-telegram');
+const config = require('./config');
+const state = require('./lib/state');
+const { gravityScore, dedupeSimilar, interestHits } = require('./lib/rank');
+const { clip: clipBase, sleep } = require('./lib/util');
 
 const UA =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
@@ -59,7 +63,6 @@ async function fetchJson(url, opts) {
   return JSON.parse(await fetchText(url, opts));
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const num = (n) => Number(n).toLocaleString('ko-KR', { maximumFractionDigits: 2 });
 const signed = (n) => (n >= 0 ? '+' : '') + num(n);
 
@@ -67,12 +70,7 @@ const signed = (n) => (n >= 0 ? '+' : '') + num(n);
 // 요약은 GitHub repo 설명 등 각 소스가 제공하는 텍스트를
 // 그대로 쓴다. 글 페이지를 따로 fetch 하지 않으므로 요청 수가 적고 안정적이다.
 const SUMMARY_MAX = 100;
-
-// 공백 정리 후 max 길이로 자르고 말줄임표를 붙인다.
-const clip = (s, max = SUMMARY_MAX) => {
-  const t = String(s ?? '').replace(/\s+/g, ' ').trim();
-  return t.length > max ? `${t.slice(0, max).trim()}…` : t;
-};
+const clip = (s, max = SUMMARY_MAX) => clipBase(s, max);
 
 // 콤마 포함 금융 수치를 숫자로 파싱한다. 빈 값은 NaN 으로 처리해 후속 isFinite 에서 거른다.
 const parsePrice = (v) => {
@@ -99,7 +97,7 @@ async function collectYozm() {
   });
   if (!out.length) throw new Error('기사 없음');
   // 요즘IT는 제목만 표시하므로 요약(og:description)을 가져오지 않는다.
-  // 후보를 넉넉히 반환하고 최종 5개(AI 관련도순) 선별은 LLM(enrich)이 한다.
+  // 후보를 넉넉히 반환하고 LLM이 중요도 점수를 매겨 임계값 이상 상위 N개를 선별한다.
   return out.slice(0, 15);
 }
 
@@ -115,7 +113,8 @@ async function collectGithub() {
     out.push({ repo, url: `https://github.com/${repo}`, desc, stars });
   });
   if (!out.length) throw new Error('저장소 없음');
-  return out.slice(0, 5);
+  // 후보를 넉넉히 반환하고 중복 제거 없이 unseen 처리 후 config.counts.github 개로 자른다.
+  return out.slice(0, 15);
 }
 
 // 코스피/코스닥: 네이버 금융 실시간 polling API.
@@ -147,41 +146,107 @@ async function collectUsdKrw() {
   return { current: krw, updated: data.time_last_update_utc };
 }
 
-// 한국경제 RSS(<item> 목록)에서 제목·링크를 추출한다. CDATA 래핑을 허용한다.
-// 헤드라인 자체가 한 줄 요약 역할을 하므로 별도 og:description 은 붙이지 않는다.
-async function fetchRssItems(url, limit) {
-  const xml = await fetchText(url);
+// RSS XML(<item> 목록)에서 제목·링크를 추출하는 순수 함수. CDATA 래핑을 허용한다.
+// 네트워크가 없어 단위테스트가 쉽다.
+function parseRssItems(xml, limit = Infinity) {
   const pick = (block, tag) => {
     const m = block.match(
       new RegExp(`<${tag}>(?:<!\\[CDATA\\[)?([\\s\\S]*?)(?:\\]\\]>)?</${tag}>`)
     );
     return m ? m[1].trim() : '';
   };
-  const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)]
+  return [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)]
     .map((m) => ({ title: pick(m[1], 'title'), url: pick(m[1], 'link') }))
     .filter((x) => x.title && x.url)
     .slice(0, limit);
+}
+
+// 한국경제 RSS 후보를 가져온다(헤드라인 자체가 한 줄 요약 역할).
+async function fetchRssItems(url, limit) {
+  const items = parseRssItems(await fetchText(url), limit);
   if (!items.length) throw new Error('뉴스 없음');
   return items;
 }
 
-// 증권(finance) 피드: 실제 마켓 헤드라인. economy 피드는 기업 PR 위주라 부적합.
-const collectMarketNews = () => fetchRssItems('https://www.hankyung.com/feed/finance', 4);
+// 증권(finance) 피드: 실제 마켓 헤드라인. 후보를 넉넉히 받아 중복 제거 후 자른다.
+const collectMarketNews = () => fetchRssItems(config.feeds.marketNews, 12);
 
 // 지난밤 미국 증시 관련 뉴스: 국제 피드는 일반 세계뉴스(폭염·정치 등)가 섞여 있어,
-// 증시·금융 관련 키워드가 제목에 든 글만 추린다. 매칭이 없으면 빈 배열(헤드라인 생략).
-const US_MARKET_KW = [
-  '뉴욕증시', '나스닥', 'S&P', '다우', '월가', '월스트리트', '연준', '연은', 'Fed', 'FOMC',
-  '금리', '인플레', '국채', '달러', '위안화', '엔화', '환율', '증시', '주가', '스테이블코인',
-  '펀드', '마진', '관세', '반도체', '엔비디아', '마이크론', '상장', 'IPO',
-];
+// 증시·금융 키워드가 제목에 든 글만 추린다. 매칭이 없으면 빈 배열(헤드라인 생략).
 async function collectGlobalNews() {
-  const items = await fetchRssItems('https://www.hankyung.com/feed/international', 30);
-  return items.filter((n) => US_MARKET_KW.some((kw) => n.title.includes(kw))).slice(0, 3);
+  const items = await fetchRssItems(config.feeds.globalNews, 30);
+  return items.filter((n) => config.usMarketKeywords.some((kw) => n.title.includes(kw)));
 }
 
 // 부동산 뉴스.
-const collectRealEstateNews = () => fetchRssItems('https://www.hankyung.com/feed/realestate', 4);
+const collectRealEstateNews = () => fetchRssItems(config.feeds.realEstate, 12);
+
+// ── 해외 IT 커뮤니티 (Hacker News + Reddit): 코드로 인기·시간감쇠 랭킹 ──
+// 영문 제목 그대로 노출(개발자 대상). 환각 방지를 위해 LLM 번역은 하지 않는다.
+
+// Hacker News front page (Algolia API, 무키). points·댓글수·작성시각 포함.
+async function collectHackerNews() {
+  const data = await fetchJson(
+    `https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=${config.hackerNews.fetch}`
+  );
+  const nowSec = Date.now() / 1000;
+  return (data?.hits ?? [])
+    .filter((h) => h.title)
+    .map((h) => ({
+      source: 'HN',
+      title: h.title,
+      url: h.url || `https://news.ycombinator.com/item?id=${h.objectID}`,
+      points: Number(h.points) || 0,
+      comments: Number(h.num_comments) || 0,
+      ageHours: Math.max(0, (nowSec - Number(h.created_at_i)) / 3600),
+    }))
+    .filter((h) => Number.isFinite(h.ageHours));
+}
+
+// Reddit 지정 서브레딧 top(당일). 비브라우저 UA 필요.
+async function collectReddit() {
+  const out = [];
+  const nowSec = Date.now() / 1000;
+  for (const sub of config.reddit.subreddits) {
+    try {
+      const data = await fetchJson(
+        `https://www.reddit.com/r/${sub}/top.json?t=day&limit=${config.reddit.perSub}`,
+        { headers: { 'User-Agent': 'news-collector/1.0' } }
+      );
+      for (const c of data?.data?.children ?? []) {
+        const p = c.data;
+        if (!p?.title) continue;
+        out.push({
+          source: `r/${sub}`,
+          title: p.title,
+          url: `https://www.reddit.com${p.permalink}`,
+          points: Number(p.score) || 0,
+          comments: Number(p.num_comments) || 0,
+          ageHours: Math.max(0, (nowSec - Number(p.created_utc)) / 3600),
+        });
+      }
+    } catch (err) {
+      console.warn(`[Reddit] r/${sub} 수집 실패: ${err?.message ?? err}`);
+    }
+  }
+  return out.filter((h) => Number.isFinite(h.ageHours));
+}
+
+// HN+Reddit 후보를 합쳐 중력점수(+관심 가중)로 랭킹한다. 최종 자르기는 main 이 한다.
+async function collectHnReddit() {
+  const [hn, rd] = await Promise.all([
+    collectHackerNews().catch(() => []),
+    collectReddit().catch(() => []),
+  ]);
+  const all = [...hn, ...rd];
+  if (!all.length) throw new Error('HN/Reddit 없음');
+  // 관심 키워드 매칭당 점수 30% 가산(양질 신호 강화).
+  for (const it of all) {
+    const base = gravityScore(it.points, it.ageHours);
+    it.score = base * (1 + 0.3 * interestHits(it.title, config.interests));
+  }
+  return all.sort((a, b) => b.score - a.score);
+}
 
 // 미국 증시 지수: S&P500(.INX)·나스닥(.IXIC)·다우(.DJI).
 // 네이버 해외지수 API. 응답은 국내 지수와 유사하게 콤마 포함 문자열로 오며,
@@ -252,6 +317,14 @@ function fmtIndex(idx) {
       summaryLine(g.summaryKo || g.desc); // LLM 한글 요약 우선, 없으면 원문 설명
     });
   } else L.push(FAIL);
+  L.push('');
+
+  L.push('#### 해외 IT 토픽 (Hacker News)');
+  if (idx.hnReddit?.length) {
+    idx.hnReddit.forEach((h, i) => {
+      L.push(`${i + 1}. [${h.title}](${h.url}) — ${h.source} ▲${h.points}·💬${h.comments}`);
+    });
+  } else L.push(FAIL);
   tgBlock(idx.telegramIt);
   L.push('');
 
@@ -301,6 +374,13 @@ function fmtIndex(idx) {
   return L.join('\n');
 }
 
+// 수집 실패 키 → 사람이 읽는 이름(실패 경고 표기용).
+const SOURCE_LABEL = {
+  yozm: '요즘IT', github: 'GitHub', news: '마켓뉴스', usIndices: '미국증시',
+  globalNews: '국제뉴스', realEstate: '부동산', kospi: '코스피', kosdaq: '코스닥',
+  usdkrw: '환율', hnReddit: 'HN/Reddit', telegram: '텔레그램채널',
+};
+
 // ── 메인 ────────────────────────────────────────────────────
 async function main() {
   const force = process.argv.includes('--force');
@@ -315,11 +395,13 @@ async function main() {
   }
 
   const idx = {};
+  const failures = [];
   const run = async (key, fn) => {
     try {
       idx[key] = await fn();
     } catch (err) {
       idx[key] = null;
+      failures.push(key);
       console.error(`[수집 실패] ${key}: ${err?.message ?? err}`);
     }
   };
@@ -328,6 +410,7 @@ async function main() {
   await Promise.all([
     run('yozm', collectYozm),
     run('github', collectGithub),
+    run('hnReddit', collectHnReddit),
     run('news', collectMarketNews),
     run('usIndices', collectUsIndices),
     run('globalNews', collectGlobalNews),
@@ -338,38 +421,66 @@ async function main() {
     run('telegram', collectTelegramChannels), // TG 미설정 시 실패→null(섹션 생략)
   ]);
 
-  // LLM 보강(Claude Code): 요즘IT AI 선별 + GitHub 한글 요약. 실패 시 순수 코드로 폴백.
-  const enriched = await enrich({ yozm: idx.yozm ?? [], github: idx.github ?? [] });
-  // keep 목록 순서대로 재정렬 후 상위 5개. keep 이 비면 원본 순서 유지(폴백).
-  const reorder = (list, keep) =>
-    keep?.length
-      ? [...new Set(keep)].map((i) => list[i]).filter(Boolean).slice(0, 5)
-      : list.slice(0, 5);
-  if (idx.yozm) idx.yozm = reorder(idx.yozm, enriched?.yozmKeep);
+  // ── 중복 제거: 최근 N일 내 보낸 URL 제외 + 근접 중복(제목 유사) 제거 후 개수 자르기 ──
+  const seen = state.prune(state.loadSeen(), config.dedupWindowDays, Date.now());
+  const unseen = (items) => (items || []).filter((it) => it.url && !state.isSeen(seen, it.url));
+  const dedupNews = (items, n) =>
+    dedupeSimilar(unseen(items), (x) => x.title, config.nearDupThreshold).slice(0, n);
 
-  // 구독 채널 중요 메시지 선별(LLM): 카테고리(it/econ)와 요약을 받아 두 메시지에 분산.
-  // 실패 시 최신 일부를 경제 카테고리로 폴백.
-  if (idx.telegram?.length) {
-    const picked = await enrichTelegram(idx.telegram, 8);
-    const items = picked
-      ? picked
-          .filter((it) => idx.telegram[it.id])
-          .map((it) => ({ ...idx.telegram[it.id], summary: it.summary, cat: it.cat }))
-      : idx.telegram.slice(0, 7).map((m) => ({ ...m, cat: 'econ' }));
-    idx.telegramIt = items.filter((m) => m.cat === 'it');
-    idx.telegramEcon = items.filter((m) => m.cat !== 'it');
+  if (idx.yozm) idx.yozm = unseen(idx.yozm); // 후보 유지(LLM 선별)
+  if (idx.github) idx.github = unseen(idx.github).slice(0, config.counts.github);
+  if (idx.news) idx.news = dedupNews(idx.news, config.counts.marketNews);
+  if (idx.globalNews) idx.globalNews = dedupNews(idx.globalNews, config.counts.globalNews);
+  if (idx.realEstate) idx.realEstate = dedupNews(idx.realEstate, config.counts.realEstate);
+  if (idx.hnReddit) idx.hnReddit = dedupNews(idx.hnReddit, config.counts.hnReddit);
+  if (idx.telegram) idx.telegram = unseen(idx.telegram); // 후보 유지(LLM 선별)
+
+  // ── LLM 보강: 요즘IT 점수·선별 + GitHub 한글 요약. 실패 시 순수 코드 폴백 ──
+  const enriched = await enrich({
+    yozm: idx.yozm ?? [],
+    github: idx.github ?? [],
+    interests: config.interests,
+  });
+  if (idx.yozm) {
+    const cand = idx.yozm;
+    const picks = enriched?.yozm;
+    idx.yozm = picks?.length
+      ? picks
+          .filter((p) => p.score >= config.scoreThreshold && cand[p.id])
+          .map((p) => cand[p.id])
+          .slice(0, config.counts.yozm)
+      : cand.slice(0, config.counts.yozm); // 폴백: 원본 순서
   }
   if (idx.github && enriched?.githubKo) {
     idx.github.forEach((g, i) => {
-      const key = String(i);
-      if (Object.prototype.hasOwnProperty.call(enriched.githubKo, key)) {
-        g.summaryKo = enriched.githubKo[key];
+      if (Object.prototype.hasOwnProperty.call(enriched.githubKo, String(i))) {
+        g.summaryKo = enriched.githubKo[String(i)];
       }
     });
   }
 
+  // ── 구독 채널 중요 메시지: LLM 점수·분류(it/econ)·요약 → 임계값 통과분만 두 메시지로 분산 ──
+  if (idx.telegram?.length) {
+    const cand = idx.telegram;
+    const picked = await enrichTelegram(cand, config.counts.telegram, config.interests);
+    const items = picked
+      ? picked
+          .filter((it) => it.score >= config.scoreThreshold && cand[it.id])
+          .map((it) => ({ ...cand[it.id], summary: it.summary, cat: it.cat }))
+      : cand.slice(0, config.counts.telegram).map((m) => ({ ...m, cat: 'econ' }));
+    idx.telegramIt = items.filter((m) => m.cat === 'it');
+    idx.telegramEcon = items.filter((m) => m.cat !== 'it');
+  }
+
+  // ── 실패 경고: 핵심 소스 실패 시 메시지 상단에 표기(텔레그램은 미설정이면 제외) ──
+  const tgConfigured = Boolean(process.env.TG_SESSION);
+  const warned = failures.filter((k) => k !== 'telegram' || tgConfigured);
+  const warnLine = warned.length
+    ? `\n⚠️ 일부 수집 실패: ${warned.map((k) => SOURCE_LABEL[k] || k).join(', ')}\n`
+    : '';
+
   fs.mkdirSync(REPORTS_DIR, { recursive: true });
-  const section = `\n${sectionHeader} (취득 시각: ${stamp})\n\n${fmtIndex(idx)}\n`;
+  const section = `\n${sectionHeader} (취득 시각: ${stamp})\n${warnLine}\n${fmtIndex(idx)}\n`;
   if (!existing) {
     fs.writeFileSync(
       file,
@@ -379,11 +490,29 @@ async function main() {
     fs.appendFileSync(file, section);
   }
 
+  // ── 상태 갱신: 이번에 노출한 URL 을 seen 에 기록(다음 실행부터 중복 제외) ──
+  const shown = [
+    idx.yozm, idx.github, idx.news, idx.globalNews, idx.realEstate,
+    idx.hnReddit, idx.telegramIt, idx.telegramEcon,
+  ];
+  const now = Date.now();
+  for (const list of shown) {
+    for (const it of list || []) {
+      if (it?.url) state.markSeen(seen, it.url, now);
+    }
+  }
+  state.saveSeen(seen);
+
   // 성공 시 마지막 줄에 리포트 경로를 출력한다 (실행 스크립트가 이를 사용).
   process.stdout.write(file + '\n');
 }
 
-main().catch((err) => {
-  console.error(`치명적 오류: ${err.stack || err.message}`);
-  process.exit(1);
-});
+// 직접 실행될 때만 main() 을 돈다(테스트에서 require 가능하도록).
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(`치명적 오류: ${err.stack || err.message}`);
+    process.exit(1);
+  });
+}
+
+module.exports = { parsePrice, parseRssItems, fmtIndex };

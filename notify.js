@@ -1,26 +1,14 @@
 'use strict';
 
-require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
-const https = require('https');
-const axios = require('axios');
+const { TOKEN, CHAT_ID, http } = require('./lib/telegram');
+const { sleep } = require('./lib/util');
 
-const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-
-if (!TOKEN || !CHAT_ID) {
-  console.error('.env 파일에 TELEGRAM_BOT_TOKEN과 TELEGRAM_CHAT_ID를 설정하세요.');
-  process.exit(1);
-}
-
-const ipv4Agent = new https.Agent({ family: 4 });
-const http = axios.create({ httpsAgent: ipv4Agent, timeout: 15000 });
 const API = `https://api.telegram.org/bot${TOKEN}`;
 
 const CHUNK_LIMIT = 4000; // Telegram 4096자 한도 - 안전 여유
 const MAX_RETRIES = 3;
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ── 마크다운 → Telegram HTML 변환 ───────────────────────────
 // 리포트가 쓰는 부분집합만 변환한다: 헤더(#), 굵게(**), 링크([](url)).
@@ -104,6 +92,10 @@ async function sendChunk(text) {
 }
 
 async function main() {
+  if (!TOKEN || !CHAT_ID) {
+    console.error('.env 파일에 TELEGRAM_BOT_TOKEN과 TELEGRAM_CHAT_ID를 설정하세요.');
+    process.exit(1);
+  }
   const filePath = process.argv[2];
   if (!filePath) {
     console.error('사용법: node notify.js <리포트_파일_경로>');
@@ -174,4 +166,7 @@ async function main() {
   }
 }
 
-main();
+// 직접 실행될 때만 전송한다(테스트에서 순수 함수 require 가능하도록).
+if (require.main === module) main();
+
+module.exports = { mdToHtml, splitByLines, escapeHtml, renderInline };

@@ -4,7 +4,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 if REPORT=$(node collect.js); then
-  node notify.js "$REPORT"
+  if ! node notify.js "$REPORT"; then
+    echo "전송 실패"
+    node alert.js "텔레그램 전송 실패 ($REPORT)" || true
+    exit 1
+  fi
 else
   code=$?
   if [ "$code" -eq 3 ]; then
@@ -12,5 +16,6 @@ else
     exit 0
   fi
   echo "수집 실패 (exit $code)"
+  node alert.js "수집 실패 (exit $code) — cron.log 확인" || true
   exit "$code"
 fi
